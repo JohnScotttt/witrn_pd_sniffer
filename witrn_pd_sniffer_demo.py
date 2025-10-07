@@ -11,7 +11,7 @@ import time
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import json
-from witrnhid import WITRN_DEV
+from witrnhid import WITRN_DEV, metadata
 import sys
 
 
@@ -415,23 +415,33 @@ class WITRNGUI:
             self.data_text.delete(1.0, tk.END)
 
             # 基本信息
-            info = f"""基本信息:
-序号: {item.index}
-时间: {item.timestamp}
-SOP: {item.sop}
-PPR: {item.ppr}
-PDR: {item.pdr}
-消息类型: {item.msg_type}
+            info = (f"基本信息:\n序号: {item.index}\n时间: {item.timestamp}\nSOP: {item.sop}\n"
+                    f"PPR: {item.ppr}\nPDR: {item.pdr}\n消息类型: {item.msg_type}\n\n详细数据:\n")
 
-详细数据:
-"""
-
-            data_str = str(item.data)
+            data_str = self.format_data(item.data)
 
             self.data_text.insert(tk.END, info + data_str)
         finally:
             # 设回只读，防止用户编辑
             self.data_text.config(state=tk.DISABLED)
+
+    def format_data(self, data: metadata):
+        data_str = ""
+        for value1 in data.value():
+            if not isinstance(value1.value(), list):
+                data_str += f"{value1.field()}: {value1.value()}\n"
+            else:
+                data_str += f"{value1.field()}:\n"
+                for value2 in value1.value():
+                    if not isinstance(value2.value(), list):
+                        data_str += f"    {value2.field()}: {value2.value()}\n"
+                    else:
+                        data_str += f"    {value2.field()}:\n"
+                        for value3 in value2.value():
+                            if not isinstance(value3.value(), list):
+                                data_str += f"        {value3.field()}: {value3.value()}\n"
+        return data_str
+
     
     def copy_data(self):
         """复制当前显示的数据到剪贴板"""

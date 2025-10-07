@@ -1,0 +1,3 @@
+*.build
+*.dist
+*.onefile-build
