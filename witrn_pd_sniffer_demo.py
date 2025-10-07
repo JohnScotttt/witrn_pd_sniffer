@@ -11,7 +11,7 @@ import time
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import json
-import witrnhid
+from witrnhid import WITRN_DEV
 import sys
 
 
@@ -522,7 +522,7 @@ if __name__ == "__main__":
     
     # 尝试创建WITRN设备，如果无法打开则弹窗并退出
     try:
-        k2 = witrnhid.WITRN_DEV()
+        k2 = WITRN_DEV()
         app.k2 = k2
         # 启用开始按钮（如果之前被禁用）
         try:
