@@ -572,4 +572,4 @@ if __name__ == "__main__":
     # 运行GUI（如果未连接设备，GUI 仍然可运行，用户可看到错误状态并可手动重连）
     app.run()
 
-# python -m nuitka witrn_pd_gui_demo.py --standalone --onefile --windows-disable-console --enable-plugin=tk-inter
+# python -m nuitka witrn_pd_sniffer_demo.py --standalone --onefile --windows-disable-console --enable-plugin=tk-inter
