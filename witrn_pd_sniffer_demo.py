@@ -5,7 +5,8 @@ WITRN HID PD查看器 GUI 应用程序
 """
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, filedialog
+import csv
 import threading
 import time
 from datetime import datetime
@@ -177,14 +178,14 @@ class WITRNGUI:
         # 让该框架水平扩展，这样状态显示可以右对齐到该框架的末端
         data_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
         
-        # 复制按钮
-        self.copy_button = ttk.Button(
-            data_frame, 
-            text="复制数据", 
-            command=self.copy_data,
+        # 导出列表按钮（导出为 CSV）
+        self.export_button = ttk.Button(
+            data_frame,
+            text="导出列表",
+            command=self.export_list,
             state=tk.DISABLED
         )
-        self.copy_button.pack(side=tk.LEFT, padx=(0, 10))
+        self.export_button.pack(side=tk.LEFT, padx=(0, 10))
         
         # 清空按钮
         self.clear_button = ttk.Button(
@@ -194,21 +195,12 @@ class WITRNGUI:
         )
         self.clear_button.pack(side=tk.LEFT)
 
-        # 状态显示（与清空按钮同级，右对齐）
-        # 放在 data_frame 内并靠右显示，保留 relief 以突出显示
-        
-        # 状态显示（与清空按钮同级，右对齐）
-        # 放在 data_frame 内并靠右显示，保留 relief 以突出显示
+        # 状态变量（显示在右侧数据显示区域底部的状态栏）
         self.status_var = tk.StringVar()
         self.status_var.set("就绪")
-        # 使用容器使状态显示固定像素宽度（200px）
-        # 给容器一个固定高度以匹配按钮行的高度
-        status_container = ttk.Frame(data_frame, width=200, height=20)
-        status_container.pack(side=tk.RIGHT, padx=(10, 0))
-        # 不允许容器根据子控件自动调整大小，保持固定宽度
-        status_container.pack_propagate(False)
-        status_label = ttk.Label(status_container, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.E)
-        status_label.pack(fill=tk.BOTH, expand=True)
+        # 在 right_frame 底部放置横向状态栏，便于显示较长文本
+        status_label = ttk.Label(right_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
+        status_label.pack(side=tk.BOTTOM, fill=tk.X, pady=(5, 0))
 
         # 在 header 中放置复选框以与标题并列
         self.filter_goodcrc_var = tk.BooleanVar(value=False)
@@ -287,37 +279,50 @@ class WITRNGUI:
                     data = pkg
                     self.add_data_item(sop, ppr, pdr, msg_type, data)
             except Exception as e:
-                # 发生异常，认为设备可能已断开或不可用
-                print(f"数据采集异常，设备可能断开: {e}")
-                # 将设备句柄置空，停止当前数据收集状态
-                try:
-                    self.k2 = None
-                    self.data_collection_active = False
-                except Exception:
-                    pass
-
-                # 在线程安全地更新 UI：启用重连按钮，禁用开始/暂停按钮，更新状态
-                def _on_disconnect():
+                # 仅当是真正的 read error 时才视为设备断开；其他错误可能不严重
+                err_text = str(e).lower()
+                if 'read error' in err_text or 'readerror' in err_text:
+                    # 发生 read error，认为设备已断开或不可用
+                    print(f"数据采集异常（断开）: {e}")
+                    # 将设备句柄置空，停止当前数据收集状态
                     try:
-                        self.status_var.set("设备断开")
-                        self.start_button.config(state=tk.DISABLED)
-                        self.pause_button.config(state=tk.DISABLED)
-                        self.reconnect_button.config(state=tk.NORMAL)
-                        # 弹窗提示用户设备断开
-                        try:
-                            messagebox.showwarning("设备断开", "检测到设备已断开，请重连或检查连接。")
-                        except Exception:
-                            pass
+                        self.k2 = None
+                        self.data_collection_active = False
                     except Exception:
                         pass
 
-                try:
-                    self.root.after(0, _on_disconnect)
-                except Exception:
-                    pass
+                    # 在线程安全地更新 UI：启用重连按钮，禁用开始/暂停按钮，更新状态
+                    def _on_disconnect():
+                        try:
+                            self.status_var.set("设备断开")
+                            self.start_button.config(state=tk.DISABLED)
+                            self.pause_button.config(state=tk.DISABLED)
+                            self.reconnect_button.config(state=tk.NORMAL)
+                            # 弹窗提示用户设备断开
+                            try:
+                                messagebox.showwarning("设备断开", "检测到设备已断开，请重连或检查连接。")
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
 
-                # 休眠后继续等待重连
-                time.sleep(0.5)
+                    try:
+                        self.root.after(0, _on_disconnect)
+                    except Exception:
+                        pass
+
+                    # 休眠后继续等待重连
+                    time.sleep(0.5)
+                else:
+                    # 非 read error：记录为警告并继续（不认为设备断开）
+                    print(f"数据采集警告（非断开）: {e}")
+                    try:
+                        # 在状态栏短暂显示警告信息（不打断用户）
+                        self.root.after(0, lambda: self.status_var.set(f"数据采集错误（可忽略）: {e}"))
+                    except Exception:
+                        pass
+                    # 短暂停顿后继续循环，避免高速打印
+                    time.sleep(0.1)
     
     def update_treeview(self):
         """更新Treeview显示"""
@@ -358,6 +363,14 @@ class WITRNGUI:
                     self.tree.focus(child)
                     self.tree.see(child)
                     break
+        # 根据是否有数据启用/禁用导出按钮
+        try:
+            if self.data_list:
+                self.export_button.config(state=tk.NORMAL)
+            else:
+                self.export_button.config(state=tk.DISABLED)
+        except Exception:
+            pass
     
     def on_item_select(self, event):
         """处理列表项选择事件"""
@@ -369,7 +382,6 @@ class WITRNGUI:
             if 0 <= index < len(self.data_list):
                 self.current_selection = self.data_list[index]
                 self.display_data(self.current_selection)
-                self.copy_button.config(state=tk.NORMAL)
     
     def on_item_click(self, event):
         """处理鼠标点击事件，确保选中行高亮显示"""
@@ -452,6 +464,33 @@ class WITRNGUI:
             self.status_var.set("数据已复制到剪贴板")
         else:
             messagebox.showwarning("警告", "请先选择要复制的数据项")
+
+    def export_list(self):
+        """将当前数据列表导出为 CSV 文件（包含详细数据字段）"""
+        if not self.data_list:
+            messagebox.showwarning("警告", "没有数据可导出")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension='.csv',
+            filetypes=[('CSV 文件', '*.csv')],
+            title='保存为 CSV'
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['序号', '时间', 'SOP', 'PPR', 'PDR', 'Msg Type', '详细数据'])
+                for item in self.data_list:
+                    # 使用 format_data 输出的人类可读文本作为详细数据字段
+                    data_text = self.format_data(item.data)
+                    writer.writerow([item.index, item.timestamp, item.sop, item.ppr, item.pdr, item.msg_type, data_text])
+
+            self.status_var.set(f"已导出 {len(self.data_list)} 条数据 到 {file_path}")
+        except Exception as e:
+            messagebox.showerror("导出失败", f"导出 CSV 失败:\n{e}")
     
     def clear_list(self):
         """清空数据列表"""
@@ -465,7 +504,10 @@ class WITRNGUI:
                 self.data_text.delete(1.0, tk.END)
             finally:
                 self.data_text.config(state=tk.DISABLED)
-            self.copy_button.config(state=tk.DISABLED)
+            try:
+                self.export_button.config(state=tk.DISABLED)
+            except Exception:
+                pass
             self.status_var.set("列表已清空")
     
     def start_collection(self):
