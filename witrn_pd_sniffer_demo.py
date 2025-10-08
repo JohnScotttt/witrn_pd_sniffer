@@ -33,7 +33,7 @@ class WITRNGUI:
     
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("WITRN HID 数据查看器")
+        self.root.title("WITRN PD解析v1.1")
         self.root.geometry("1300x800")
         # 锁定窗口大小，禁止用户调整（固定宽高）
         self.root.resizable(False, False)
