@@ -33,8 +33,8 @@ class WITRNGUI:
     
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("WITRN PD解析v1.2")
-        self.root.geometry("1300x800")
+        self.root.title("WITRN PD解析v1.3 by JohnScotttt")
+        self.root.geometry("1600x900")
         # 锁定窗口大小，禁止用户调整（固定宽高）
         self.root.resizable(False, False)
         try:
