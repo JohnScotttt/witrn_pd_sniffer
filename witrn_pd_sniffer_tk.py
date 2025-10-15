@@ -33,12 +33,12 @@ class WITRNGUI:
     
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("WITRN PD解析v1.1")
+        self.root.title("WITRN PD解析v1.2")
         self.root.geometry("1300x800")
         # 锁定窗口大小，禁止用户调整（固定宽高）
         self.root.resizable(False, False)
         try:
-            w, h = 1300, 800
+            w, h = 1600, 900
             self.root.minsize(w, h)
             self.root.maxsize(w, h)
         except Exception:
@@ -206,7 +206,7 @@ class WITRNGUI:
         self.filter_goodcrc_var = tk.BooleanVar(value=False)
         self.filter_goodcrc_cb = ttk.Checkbutton(
             header_frame,
-            text="屏蔽goodCRC",
+            text="屏蔽GoodCRC",
             variable=self.filter_goodcrc_var,
             command=self.update_treeview
         )
@@ -273,9 +273,18 @@ class WITRNGUI:
                 _, pkg = self.k2.auto_unpack()
                 if pkg.field() == "pd":
                     sop = pkg["SOP*"].value()
-                    ppr = pkg["Message Header"][3].value()
-                    pdr = pkg["Message Header"][5].value()
-                    msg_type = pkg["Message Header"]["Message Type"].value()
+                    try:
+                        ppr = pkg["Message Header"][3].value()
+                    except:
+                        ppr = None
+                    try:
+                        pdr = pkg["Message Header"][5].value()
+                    except:
+                        pdr = None
+                    try:
+                        msg_type = pkg["Message Header"]["Message Type"].value()
+                    except:
+                        msg_type = None
                     data = pkg
                     self.add_data_item(sop, ppr, pdr, msg_type, data)
             except Exception as e:
@@ -326,15 +335,41 @@ class WITRNGUI:
     
     def update_treeview(self):
         """更新Treeview显示"""
-        # 保存当前选中的项目（按原始索引）
+        # 保存当前选中的项目（按 Treeview item id），以及当前滚动位置和可见性/焦点状态。
         current_selection = self.tree.selection()
         selected_index = None
-        if current_selection:
-            selected_item = self.tree.item(current_selection[0])
-            try:
-                selected_index = int(selected_item['values'][0]) - 1  # 转换为0基索引
-            except Exception:
-                selected_index = None
+        selected_item_id = None
+        selected_was_visible = False
+        selected_was_focused = False
+        try:
+            if current_selection:
+                selected_item_id = current_selection[0]
+                selected_item_vals = self.tree.item(selected_item_id)
+                try:
+                    selected_index = int(selected_item_vals['values'][0]) - 1  # 转换为0基索引
+                except Exception:
+                    selected_index = None
+
+                # 如果选中项在更新前是可见的（bbox 返回非 None），记录下来
+                try:
+                    bbox = self.tree.bbox(selected_item_id)
+                    selected_was_visible = bbox is not None
+                except Exception:
+                    selected_was_visible = False
+
+                # 记录选中项是否拥有焦点
+                try:
+                    selected_was_focused = (self.tree.focus() == selected_item_id)
+                except Exception:
+                    selected_was_focused = False
+        except Exception:
+            selected_index = None
+
+        # 保存当前滚动位置（yview），以便在不希望强制滚动时恢复用户的视图。
+        try:
+            prev_yview = self.tree.yview()
+        except Exception:
+            prev_yview = None
 
         # 重新构建可见项目，考虑过滤选项
         for child in self.tree.get_children():
@@ -354,15 +389,42 @@ class WITRNGUI:
                 item.msg_type
             ))
 
-        # 恢复选中状态（如果选中的项仍然可见）
+        # 恢复选中状态（如果选中的项仍然可见）。
+        # 重要：不要在每次刷新时强制滚动到选中项，以免打断用户的手动滚动。
         if selected_index is not None and 0 <= selected_index < len(self.data_list):
+            target_child = None
             for child in self.tree.get_children():
                 item_values = self.tree.item(child)['values']
                 if item_values and int(item_values[0]) == selected_index + 1:
-                    self.tree.selection_set(child)
-                    self.tree.focus(child)
-                    self.tree.see(child)
+                    target_child = child
                     break
+
+            if target_child is not None:
+                try:
+                    # 恢复 selection（高亮），但不要强制滚动到该项。
+                    # 将 selection_set 放在前面以保持高亮，但随后我们将恢复 yview，
+                    # 以确保用户的可视窗口不会被刷新打断。
+                    self.tree.selection_set(target_child)
+                    if selected_was_focused:
+                        try:
+                            self.tree.focus(target_child)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            # 无论选中项是否在可见区域，都尝试恢复先前的滚动位置，优先保持用户视图不变。
+            try:
+                if prev_yview and len(prev_yview) == 2:
+                    self.tree.yview_moveto(prev_yview[0])
+            except Exception:
+                pass
+            else:
+                # 如果找不到对应项，恢复原来的 yview（如果可用），以保持用户视图
+                try:
+                    if prev_yview and len(prev_yview) == 2:
+                        self.tree.yview_moveto(prev_yview[0])
+                except Exception:
+                    pass
         # 根据是否有数据启用/禁用导出按钮
         try:
             if self.data_list:
@@ -438,7 +500,7 @@ class WITRNGUI:
             self.data_text.config(state=tk.DISABLED)
 
     def format_data(self, data: metadata):
-        data_str = ""
+        data_str = f"Raw: 0x{int(data.raw(), 2):X}\n"
         for value1 in data.value():
             if not isinstance(value1.value(), list):
                 data_str += f"{value1.field()}: {value1.value()}\n"
@@ -452,6 +514,10 @@ class WITRNGUI:
                         for value3 in value2.value():
                             if not isinstance(value3.value(), list):
                                 data_str += f"        {value3.field()}: {value3.value()}\n"
+                            else:
+                                data_str += f"        {value3.field()}:\n"
+                                for value4 in value3.value():
+                                    data_str += f"            {value4.field()}: {value4.value()}\n"
         return data_str
 
     
@@ -624,4 +690,4 @@ if __name__ == "__main__":
     # 运行GUI（如果未连接设备，GUI 仍然可运行，用户可看到错误状态并可手动重连）
     app.run()
 
-# python -m nuitka witrn_pd_sniffer_demo.py --standalone --onefile --windows-disable-console --enable-plugin=tk-inter
+# python -m nuitka witrn_pd_sniffer_tk.py --standalone --onefile --windows-console-mode=disable --enable-plugin=tk-inter
