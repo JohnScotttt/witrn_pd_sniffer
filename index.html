@@ -1,0 +1,871 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WITRN PD解析v1.1</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f5f5f5;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .container {
+            display: flex;
+            height: 100vh;
+            gap: 10px;
+            padding: 10px;
+        }
+
+        /* 左侧面板 */
+        .left-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+
+        .header {
+            padding: 15px 20px;
+            border-bottom: 1px solid #e0e0e0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .header h2 {
+            color: #333;
+            font-size: 18px;
+        }
+
+        .filter-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .filter-checkbox {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .filter-checkbox input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+        }
+
+        /* 数据表格 */
+        .table-container {
+            flex: 1;
+            overflow: auto;
+            position: relative;
+        }
+
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+
+        .data-table th {
+            background-color: #f8f9fa;
+            color: #495057;
+            font-weight: 600;
+            padding: 12px 8px;
+            text-align: center;
+            border-bottom: 2px solid #dee2e6;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+
+        .data-table td {
+            padding: 10px 8px;
+            text-align: center;
+            border-bottom: 1px solid #e9ecef;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        .data-table tr:hover {
+            background-color: #f8f9fa;
+        }
+
+        .data-table tr.selected {
+            background-color: #0078d4 !important;
+            color: white;
+        }
+
+        .data-table tr.selected:hover {
+            background-color: #106ebe !important;
+        }
+
+        /* 右侧面板 */
+        .right-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+
+        .panel-header {
+            padding: 15px 20px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+
+        .panel-header h2 {
+            color: #333;
+            font-size: 18px;
+        }
+
+        /* 数据显示区域 */
+        .data-display {
+            flex: 1;
+            padding: 20px;
+            overflow: auto;
+        }
+
+        .data-content {
+            background-color: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 4px;
+            padding: 15px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 12px;
+            line-height: 1.4;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            min-height: 300px;
+            color: #495057;
+        }
+
+        /* 按钮区域 */
+        .button-panel {
+            padding: 20px;
+            border-top: 1px solid #e0e0e0;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .button-row {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-align: center;
+            min-width: 100px;
+        }
+
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .btn-primary {
+            background-color: #0078d4;
+            color: white;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background-color: #106ebe;
+        }
+
+        .btn-secondary {
+            background-color: #6c757d;
+            color: white;
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background-color: #545b62;
+        }
+
+        .btn-success {
+            background-color: #28a745;
+            color: white;
+        }
+
+        .btn-success:hover:not(:disabled) {
+            background-color: #218838;
+        }
+
+        .btn-warning {
+            background-color: #ffc107;
+            color: #212529;
+        }
+
+        .btn-warning:hover:not(:disabled) {
+            background-color: #e0a800;
+        }
+
+        .btn-danger {
+            background-color: #dc3545;
+            color: white;
+        }
+
+        .btn-danger:hover:not(:disabled) {
+            background-color: #c82333;
+        }
+
+        /* 状态栏 */
+        .status-bar {
+            padding: 10px 20px;
+            background-color: #f8f9fa;
+            border-top: 1px solid #e0e0e0;
+            color: #6c757d;
+            font-size: 13px;
+        }
+
+        /* 空状态 */
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 200px;
+            color: #6c757d;
+            font-size: 14px;
+        }
+
+        .empty-state i {
+            font-size: 48px;
+            margin-bottom: 10px;
+            opacity: 0.5;
+        }
+
+        /* 响应式设计 */
+        @media (max-width: 1200px) {
+            .container {
+                flex-direction: column;
+            }
+            
+            .left-panel, .right-panel {
+                height: 50vh;
+            }
+        }
+
+        /* 滚动条样式 */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #f1f1f1;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #c1c1c1;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #a8a8a8;
+        }
+
+        /* 自定义确认对话框样式 */
+        .confirm-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.5);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+
+        .confirm-dialog {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+            padding: 0;
+            max-width: 400px;
+            width: 90%;
+            overflow: hidden;
+        }
+
+        .confirm-header {
+            background: #f8f9fa;
+            padding: 20px 20px 15px;
+            border-bottom: 1px solid #e9ecef;
+        }
+
+        .confirm-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #333;
+            margin: 0;
+        }
+
+        .confirm-body {
+            padding: 20px;
+        }
+
+        .confirm-message {
+            font-size: 14px;
+            color: #666;
+            line-height: 1.5;
+            margin: 0;
+        }
+
+        .confirm-footer {
+            padding: 15px 20px;
+            background: #f8f9fa;
+            border-top: 1px solid #e9ecef;
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+        }
+
+        .confirm-btn {
+            padding: 8px 20px;
+            border: none;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            min-width: 80px;
+        }
+
+        .confirm-btn-cancel {
+            background: #6c757d;
+            color: white;
+        }
+
+        .confirm-btn-cancel:hover {
+            background: #545b62;
+        }
+
+        .confirm-btn-ok {
+            background: #dc3545;
+            color: white;
+        }
+
+        .confirm-btn-ok:hover {
+            background: #c82333;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- 左侧数据列表面板 -->
+        <div class="left-panel">
+            <div class="header">
+                <h2>数据列表</h2>
+                <div class="filter-container">
+                    <div class="filter-checkbox">
+                        <input type="checkbox" id="filterGoodCrc">
+                        <label for="filterGoodCrc">屏蔽GoodCRC</label>
+                    </div>
+                </div>
+            </div>
+            <div class="table-container">
+                <table class="data-table" id="dataTable">
+                    <thead>
+                        <tr>
+                            <th style="width: 60px;">序号</th>
+                            <th style="width: 100px;">时间</th>
+                            <th style="width: 120px;">SOP</th>
+                            <th style="width: 150px;">PPR</th>
+                            <th style="width: 120px;">PDR</th>
+                            <th>Msg Type</th>
+                        </tr>
+                    </thead>
+                    <tbody id="dataTableBody">
+                        <!-- 数据行将通过JavaScript动态添加 -->
+                    </tbody>
+                </table>
+                <div id="emptyState" class="empty-state" style="display: none;">
+                    <div>📊</div>
+                    <div>暂无数据</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 右侧数据显示面板 -->
+        <div class="right-panel">
+            <div class="panel-header">
+                <h2>数据显示</h2>
+            </div>
+            <div class="data-display">
+                <div class="data-content" id="dataContent">
+                    请从左侧列表选择数据项查看详细信息
+                </div>
+            </div>
+            <div class="button-panel">
+                <div class="button-row">
+                    <button class="btn btn-primary" id="startBtn">开始收集</button>
+                    <button class="btn btn-secondary" id="pauseBtn" disabled>暂停</button>
+                    <button class="btn btn-warning" id="reconnectBtn">重连设备</button>
+                </div>
+                <div class="button-row">
+                    <button class="btn btn-success" id="exportBtn" disabled>导出列表</button>
+                    <button class="btn btn-danger" id="clearBtn">清空列表</button>
+                </div>
+            </div>
+            <div class="status-bar" id="statusBar">
+                就绪
+            </div>
+        </div>
+    </div>
+
+    <script>
+        class WITRNWebApp {
+            constructor() {
+                this.dataList = [];
+                this.currentSelection = null;
+                this.isPaused = false;
+                this.dataCollectionActive = false;
+                
+                this.initializeElements();
+                this.bindEvents();
+                this.updateDisplay();
+            }
+
+            initializeElements() {
+                this.dataTableBody = document.getElementById('dataTableBody');
+                this.dataContent = document.getElementById('dataContent');
+                this.emptyState = document.getElementById('emptyState');
+                this.statusBar = document.getElementById('statusBar');
+                this.filterGoodCrc = document.getElementById('filterGoodCrc');
+                
+                // 按钮
+                this.startBtn = document.getElementById('startBtn');
+                this.pauseBtn = document.getElementById('pauseBtn');
+                this.exportBtn = document.getElementById('exportBtn');
+                this.clearBtn = document.getElementById('clearBtn');
+                this.reconnectBtn = document.getElementById('reconnectBtn');
+            }
+
+            bindEvents() {
+                // 按钮事件
+                this.startBtn.addEventListener('click', () => this.startCollection());
+                this.pauseBtn.addEventListener('click', () => this.pauseCollection());
+                this.exportBtn.addEventListener('click', () => this.exportList());
+                this.clearBtn.addEventListener('click', () => this.clearList());
+                this.reconnectBtn.addEventListener('click', () => this.reconnectDevice());
+                
+                // 过滤事件
+                this.filterGoodCrc.addEventListener('change', () => this.updateTable());
+                
+                // 表格点击事件
+                this.dataTableBody.addEventListener('click', (e) => {
+                    const row = e.target.closest('tr');
+                    if (row) {
+                        this.selectRow(row);
+                    }
+                });
+            }
+
+            // 添加数据项
+            addDataItem(sop, ppr, pdr, msgType, data, force = false) {
+                if (!force && (!this.dataCollectionActive || this.isPaused)) {
+                    return;
+                }
+
+                const timestamp = new Date().toLocaleTimeString('zh-CN', {
+                    hour12: false,
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit',
+                    fractionalSecondDigits: 3
+                });
+
+                const item = {
+                    index: this.dataList.length + 1,
+                    timestamp: timestamp,
+                    sop: sop,
+                    ppr: ppr,
+                    pdr: pdr,
+                    msgType: msgType,
+                    data: data || {}
+                };
+
+                this.dataList.push(item);
+                this.updateStatus(`已读取 ${this.dataList.length} 条数据`);
+                this.updateTable();
+            }
+
+            // 更新表格显示
+            updateTable() {
+                const hideGoodCrc = this.filterGoodCrc.checked;
+                const filteredData = hideGoodCrc 
+                    ? this.dataList.filter(item => !item.msgType.toLowerCase().includes('goodcrc'))
+                    : this.dataList;
+
+                this.dataTableBody.innerHTML = '';
+                
+                if (filteredData.length === 0) {
+                    this.emptyState.style.display = 'flex';
+                    this.dataTableBody.style.display = 'none';
+                } else {
+                    this.emptyState.style.display = 'none';
+                    this.dataTableBody.style.display = 'table-row-group';
+                    
+                    filteredData.forEach(item => {
+                        const row = document.createElement('tr');
+                        row.innerHTML = `
+                            <td>${item.index}</td>
+                            <td>${item.timestamp}</td>
+                            <td>${item.sop}</td>
+                            <td>${item.ppr}</td>
+                            <td>${item.pdr}</td>
+                            <td>${item.msgType}</td>
+                        `;
+                        this.dataTableBody.appendChild(row);
+                    });
+                }
+
+                this.updateExportButton();
+            }
+
+            // 选择行
+            selectRow(row) {
+                // 移除所有选中状态
+                document.querySelectorAll('.data-table tr').forEach(r => {
+                    r.classList.remove('selected');
+                });
+                
+                // 添加选中状态
+                row.classList.add('selected');
+                
+                // 获取选中项的数据
+                const index = parseInt(row.cells[0].textContent);
+                this.currentSelection = this.dataList.find(item => item.index === index);
+                
+                if (this.currentSelection) {
+                    this.displayData(this.currentSelection);
+                }
+            }
+
+            // 显示数据详情
+            displayData(item) {
+                const info = `基本信息:
+序号: ${item.index}
+时间: ${item.timestamp}
+SOP: ${item.sop}
+PPR: ${item.ppr}
+PDR: ${item.pdr}
+消息类型: ${item.msgType}
+
+详细数据:
+${this.formatData(item.data)}`;
+
+                this.dataContent.textContent = info;
+            }
+
+            // 格式化数据
+            formatData(data) {
+                if (!data || typeof data !== 'object') {
+                    return JSON.stringify(data, null, 2);
+                }
+
+                let result = '';
+                
+                if (data.value && typeof data.value === 'function') {
+                    // 处理metadata对象
+                    try {
+                        const values = data.value();
+                        for (const value of values) {
+                            if (!Array.isArray(value.value())) {
+                                result += `${value.field()}: ${value.value()}\n`;
+                            } else {
+                                result += `${value.field()}:\n`;
+                                for (const subValue of value.value()) {
+                                    if (!Array.isArray(subValue.value())) {
+                                        result += `    ${subValue.field()}: ${subValue.value()}\n`;
+                                    } else {
+                                        result += `    ${subValue.field()}:\n`;
+                                        for (const subSubValue of subValue.value()) {
+                                            if (!Array.isArray(subSubValue.value())) {
+                                                result += `        ${subSubValue.field()}: ${subSubValue.value()}\n`;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        result = JSON.stringify(data, null, 2);
+                    }
+                } else {
+                    result = JSON.stringify(data, null, 2);
+                }
+                
+                return result;
+            }
+
+            // 开始收集
+            startCollection() {
+                this.dataCollectionActive = true;
+                this.isPaused = false;
+                this.startBtn.disabled = true;
+                this.pauseBtn.disabled = false;
+                this.pauseBtn.textContent = '暂停';
+                this.updateStatus('数据收集中...');
+                this.reconnectBtn.disabled = true;
+                
+                // 通知后端开始收集
+                pywebview.api.start_collection();
+            }
+
+            // 暂停收集
+            pauseCollection() {
+                if (this.isPaused) {
+                    this.isPaused = false;
+                    this.pauseBtn.textContent = '暂停';
+                    this.updateStatus('数据收集中...');
+                } else {
+                    this.isPaused = true;
+                    this.pauseBtn.textContent = '恢复';
+                    this.updateStatus('数据收集已暂停');
+                }
+                
+                // 通知后端暂停状态
+                pywebview.api.pause_collection(this.isPaused);
+            }
+
+            // 重连设备
+            reconnectDevice() {
+                this.updateStatus('尝试连接设备...');
+                pywebview.api.reconnect_device().then(result => {
+                    if (result.success) {
+                        this.updateStatus('设备已连接');
+                        this.startBtn.disabled = false;
+                        this.reconnectBtn.disabled = true;
+                    } else {
+                        this.updateStatus('无法连接到K2');
+                        this.showInfoDialog('重连失败', result.error);
+                    }
+                });
+            }
+
+            // 导出列表
+            exportList() {
+                if (this.dataList.length === 0) {
+                    this.showInfoDialog('提示', '没有数据可导出');
+                    return;
+                }
+
+                pywebview.api.export_list().then(result => {
+                    if (result.success) {
+                        this.updateStatus(`已导出 ${this.dataList.length} 条数据`);
+                    } else {
+                        this.showInfoDialog('导出失败', result.error);
+                    }
+                });
+            }
+
+            // 清空列表
+            clearList() {
+                this.showConfirmDialog(
+                    '确认',
+                    '确定要清空所有数据吗？',
+                    () => {
+                        this.dataList = [];
+                        this.currentSelection = null;
+                        this.updateTable();
+                        this.dataContent.textContent = '请从左侧列表选择数据项查看详细信息';
+                        this.updateStatus('列表已清空');
+                        
+                        // 通知后端清空
+                        pywebview.api.clear_list();
+                    }
+                );
+            }
+
+            // 更新显示
+            updateDisplay() {
+                this.updateTable();
+                this.updateExportButton();
+            }
+
+            // 更新导出按钮状态
+            updateExportButton() {
+                this.exportBtn.disabled = this.dataList.length === 0;
+            }
+
+            // 更新状态
+            updateStatus(message) {
+                this.statusBar.textContent = message;
+            }
+
+            // 显示自定义确认对话框
+            showConfirmDialog(title, message, onConfirm) {
+                // 创建遮罩层
+                const overlay = document.createElement('div');
+                overlay.className = 'confirm-overlay';
+                
+                // 创建对话框
+                const dialog = document.createElement('div');
+                dialog.className = 'confirm-dialog';
+                
+                dialog.innerHTML = `
+                    <div class="confirm-header">
+                        <h3 class="confirm-title">${title}</h3>
+                    </div>
+                    <div class="confirm-body">
+                        <p class="confirm-message">${message}</p>
+                    </div>
+                    <div class="confirm-footer">
+                        <button class="confirm-btn confirm-btn-cancel">取消</button>
+                        <button class="confirm-btn confirm-btn-ok">确定</button>
+                    </div>
+                `;
+                
+                overlay.appendChild(dialog);
+                document.body.appendChild(overlay);
+                
+                // 绑定事件
+                const cancelBtn = dialog.querySelector('.confirm-btn-cancel');
+                const okBtn = dialog.querySelector('.confirm-btn-ok');
+                
+                const closeDialog = () => {
+                    document.body.removeChild(overlay);
+                };
+                
+                cancelBtn.addEventListener('click', closeDialog);
+                okBtn.addEventListener('click', () => {
+                    closeDialog();
+                    if (onConfirm) {
+                        onConfirm();
+                    }
+                });
+                
+                // 点击遮罩层关闭
+                overlay.addEventListener('click', (e) => {
+                    if (e.target === overlay) {
+                        closeDialog();
+                    }
+                });
+                
+                // ESC键关闭
+                const handleKeyDown = (e) => {
+                    if (e.key === 'Escape') {
+                        closeDialog();
+                        document.removeEventListener('keydown', handleKeyDown);
+                    }
+                };
+                document.addEventListener('keydown', handleKeyDown);
+            }
+
+            // 显示信息提示对话框
+            showInfoDialog(title, message) {
+                // 创建遮罩层
+                const overlay = document.createElement('div');
+                overlay.className = 'confirm-overlay';
+                
+                // 创建对话框
+                const dialog = document.createElement('div');
+                dialog.className = 'confirm-dialog';
+                
+                dialog.innerHTML = `
+                    <div class="confirm-header">
+                        <h3 class="confirm-title">${title}</h3>
+                    </div>
+                    <div class="confirm-body">
+                        <p class="confirm-message">${message}</p>
+                    </div>
+                    <div class="confirm-footer">
+                        <button class="confirm-btn confirm-btn-ok">确定</button>
+                    </div>
+                `;
+                
+                overlay.appendChild(dialog);
+                document.body.appendChild(overlay);
+                
+                // 绑定事件
+                const okBtn = dialog.querySelector('.confirm-btn-ok');
+                
+                const closeDialog = () => {
+                    document.body.removeChild(overlay);
+                };
+                
+                okBtn.addEventListener('click', closeDialog);
+                
+                // 点击遮罩层关闭
+                overlay.addEventListener('click', (e) => {
+                    if (e.target === overlay) {
+                        closeDialog();
+                    }
+                });
+                
+                // ESC键关闭
+                const handleKeyDown = (e) => {
+                    if (e.key === 'Escape') {
+                        closeDialog();
+                        document.removeEventListener('keydown', handleKeyDown);
+                    }
+                };
+                document.addEventListener('keydown', handleKeyDown);
+            }
+
+            // 从后端接收新数据
+            onDataReceived(data) {
+                this.addDataItem(data.sop, data.ppr, data.pdr, data.msg_type, data.data, true);
+            }
+
+            // 处理设备断开事件
+            onDeviceDisconnected(data) {
+                console.log('设备断开:', data.message);
+                
+                // 更新UI状态
+                this.updateStatus('设备断开');
+                this.startBtn.disabled = true;
+                this.pauseBtn.disabled = true;
+                this.pauseBtn.textContent = '暂停';
+                this.reconnectBtn.disabled = false;
+                
+                // 显示断开提示
+                this.showInfoDialog('设备断开', data.message);
+            }
+        }
+
+        // 初始化应用
+        let app;
+        
+        // 等待pywebview加载完成
+        document.addEventListener('DOMContentLoaded', () => {
+            app = new WITRNWebApp();
+        });
+
+        // 全局函数供后端调用
+        window.onDataReceived = (data) => {
+            if (app) {
+                app.onDataReceived(data);
+            }
+        };
+
+        window.onDeviceDisconnected = (data) => {
+            if (app) {
+                app.onDeviceDisconnected(data);
+            }
+        };
+    </script>
+</body>
+</html>
