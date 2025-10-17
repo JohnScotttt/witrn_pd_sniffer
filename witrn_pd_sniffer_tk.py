@@ -6,6 +6,9 @@ WITRN HID PD查看器 GUI 应用程序
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
+import os
+import base64
+import tempfile
 import csv
 import threading
 import time
@@ -13,7 +16,68 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 import json
 from witrnhid import WITRN_DEV, metadata
-import sys
+from icon import brain_ico
+
+
+MT = {
+    "GoodCRC": "#e4fdff",
+    "GotoMin": "#eea8e8",
+    "Accept": "#caffbf",
+    "Reject": "#ec7777",
+    "Ping": "#adc178",
+    "PS_RDY": "#fff0d4",
+    "Get_Source_Cap": "#949af1",
+    "Get_Sink_Cap": "#a0b6ff",
+    "DR_Swap": "#00bfff",
+    "PR_Swap": "#4293e4",
+    "VCONN_Swap": "#ffa7ff",
+    "Wait": "#ff8fab",
+    "Soft_Reset": "#da96ac",
+    "Data_Reset": "#afeeee",
+    "Data_Reset_Complete": "#dba279",
+    "Not_Supported": "#a9a9a9",
+    "Get_Source_Cap_Extended": "#bdb76b",
+    "Get_Status": "#d884d8",
+    "FR_Swap": "#556b2f",
+    "Get_PPS_Status": "#ff8c00",
+    "Get_Country_Codes": "#dbadf1",
+    "Get_Sink_Cap_Extended": "#eb7676",
+    "Get_Source_Info": "#e9967a",
+    "Get_Revision": "#8fbc8f",
+    "Source_Capabilities": "#abc4ff",
+    "Request": "#ffc6ff",
+    "BIST": "#BDDA56",
+    "Sink_Capabilities": "#20b2aa",
+    "Battery_Status": "#ffb6c0",
+    "Alert": "#afeeee",
+    "Get_Country_Info": "#ffffe0",
+    "Enter_USB": "#92ba92",
+    "EPR_Request": "#ffc6ff",
+    "EPR_Mode": "#92ba92",
+    "Source_Info": "#fff0d4",
+    "Revision": "#f0ead2",
+    "Vendor_Defined": "#bdb2ff",
+    "Source_Capabilities_Extended": "#b8e0d4",
+    "Status": "#d8bfd8",
+    "Get_Battery_Cap": "#f3907f",
+    "Get_Battery_Status": "#40e0d0",
+    "Battery_Capabilities": "#dde5b4",
+    "Get_Manufacturer_Info": "#f5deb3",
+    "Manufacturer_Info": "#c0c0c0",
+    "Security_Request": "#9acd32",
+    "Security_Response": "#da70d6",
+    "Firmware_Update_Request": "#d2b48c",
+    "Firmware_Update_Response": "#00ff7f",
+    "PPS_Status": "#7CE97C",
+    "Country_Info": "#6a5acd",
+    "Country_Codes": "#87ceeb",
+    "Sink_Capabilities_Extended": "#ee82ee",
+    "Extended_Control": "#e99771",
+    "EPR_Source_Capabilities": "#8199d1",
+    "EPR_Sink_Capabilities": "#f4a460",
+    "Vendor_Defined_Extended": "#bdb2ff",
+    "Reserved": "#fa8072",
+}
 
 
 class DataItem:
@@ -33,15 +97,51 @@ class WITRNGUI:
     
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("WITRN PD解析v1.3 by JohnScotttt")
-        self.root.geometry("1600x900")
+        # 先隐藏主窗口，等布局和几何设置完成后再显示，避免启动时小窗闪烁
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+        self.root.title("WITRN PD解析v1.4 by JohnScotttt")
+        # 使用内置的 base64 图标（brain_ico）设置窗口图标；失败则回退到本地 brain.ico
+        try:
+            ico_bytes = base64.b64decode(brain_ico)
+            tmp_path = os.path.join(tempfile.gettempdir(), "witrn_pd_sniffer_brain.ico")
+            with open(tmp_path, "wb") as f:
+                f.write(ico_bytes)
+            self.root.iconbitmap(tmp_path)
+        except Exception:
+            pass
         # 锁定窗口大小，禁止用户调整（固定宽高）
         self.root.resizable(False, False)
         try:
-            w, h = 1600, 900
+            w, h = 1600, 870
             self.root.minsize(w, h)
             self.root.maxsize(w, h)
         except Exception:
+            pass
+        # 尝试将窗口放在屏幕中央（在设置固定大小后计算）
+        try:
+            # 使用请求的大小或者当前窗口大小作为目标宽高
+            # 注意：在某些环境下 winfo_width/winfo_height 可能在窗口尚未显示前返回 1，
+            # 因此优先使用我们设置的固定尺寸 w,h（如果可用）
+            target_w = locals().get('w', None) or self.root.winfo_width()
+            target_h = locals().get('h', None) or self.root.winfo_height()
+
+            # 如果尺寸不合理（如 1），使用默认值
+            if not target_w or target_w <= 1:
+                target_w = 1600
+            if not target_h or target_h <= 1:
+                target_h = 870
+
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+            x = int((screen_w - target_w) / 2)
+            y = int((screen_h - target_h) / 2) - 50
+            # 设置几何位置为 WxH+X+Y
+            self.root.geometry(f"{int(target_w)}x{int(target_h)}+{x}+{y}")
+        except Exception:
+            # 若任何一步失败，不阻塞主程序
             pass
         
         # 数据存储
@@ -62,6 +162,13 @@ class WITRNGUI:
         # 设备句柄和数据采集线程控制
         self.k2 = None
         self.data_thread_started = False
+        # 所有初始化完成后再显示窗口，减少启动闪烁
+        try:
+            # 先让 Tk 计算完布局和几何信息，再一次性显示
+            self.root.update_idletasks()
+            self.root.deiconify()
+        except Exception:
+            pass
     
     def create_widgets(self):
         """创建界面组件"""
@@ -84,7 +191,7 @@ class WITRNGUI:
         self.tree = ttk.Treeview(left_frame, columns=columns, show='headings', height=20)
         
         # 设置列标题和宽度
-        column_widths = {'序号': 30, '时间': 80, 'SOP': 90, 'PPR': 120, 'PDR': 100, 'Msg Type': 160}
+        column_widths = {'序号': 30, '时间': 80, 'SOP': 90, 'PPR': 120, 'PDR': 80, 'Msg Type': 160}
         for col in columns:
             self.tree.heading(col, text=col)
             self.tree.column(col, width=column_widths[col], anchor=tk.CENTER)
@@ -116,6 +223,22 @@ class WITRNGUI:
         # 添加滚动条
         tree_scrollbar = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=tree_scrollbar.set)
+
+        # 为不同的消息类型注册 tag（用于行背景色）
+        # Treeview 支持按 tag 设置行的 background/foreground
+        try:
+            for msg_type, hex_color in MT.items():
+                # 使用 msg_type 名称作为 tag 名
+                # 注意：Treeview 的 tag_configure 接受颜色名称或十六进制
+                try:
+                    self.tree.tag_configure(msg_type, background=hex_color)
+                except Exception:
+                    # 如果 msg_type 包含特殊字符导致失败，则用安全的标签名
+                    safe_tag = f"mt_{abs(hash(msg_type))}"
+                    self.tree.tag_configure(safe_tag, background=hex_color)
+        except Exception:
+            # 忽略标签配置错误，程序仍能正常工作
+            pass
         
         # 布局
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -139,6 +262,17 @@ class WITRNGUI:
             state=tk.DISABLED  # 初始为只读
         )
         self.data_text.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        # 注册颜色标签（Text widget 使用 tag 来控制文本样式）
+        try:
+            self.data_text.config(selectbackground="#b4d9fb", selectforeground="black")
+            # 这里用 tag_configure 注册需要的样式名
+            self.data_text.tag_configure('red', foreground='red')
+            self.data_text.tag_configure('blue', foreground='blue')
+            self.data_text.tag_configure('green', foreground='green')
+            self.data_text.tag_configure('bold', font=('Consolas', 10, 'bold'))
+        except Exception:
+            # 在极端环境下 tag_configure 可能失败，但不影响基本功能
+            pass
         
         # 按钮框架
         button_frame = ttk.Frame(right_frame)
@@ -380,14 +514,52 @@ class WITRNGUI:
         for item in self.data_list:
             if hide_goodcrc and isinstance(item.msg_type, str) and 'goodcrc' in item.msg_type.lower():
                 continue
-            self.tree.insert('', tk.END, values=(
-                item.index,
-                item.timestamp,
-                item.sop,
-                item.ppr,
-                item.pdr,
-                item.msg_type
-            ))
+            # 计算用于 tag 的名称，优先使用 msg_type 的原始名称（如果在 MT 中注册过）
+            tag_name = None
+            try:
+                if isinstance(item.msg_type, str) and item.msg_type in MT:
+                    tag_name = item.msg_type
+                elif isinstance(item.msg_type, str):
+                    # 有时 msg_type 可能带有空格或大小写不同，尝试按不区分大小写匹配
+                    lowered = item.msg_type.lower()
+                    for k in MT.keys():
+                        if k.lower() == lowered:
+                            tag_name = k
+                            break
+                # 如果仍然没有匹配，但 msg_type 是字符串且 MT 中存在相同颜色值的安全标签，我们 won't create new colors here
+            except Exception:
+                tag_name = None
+
+            # 如果 tag_name 为 None，则不传递 tag（使用默认背景）
+            if tag_name:
+                try:
+                    self.tree.insert('', tk.END, values=(
+                        item.index,
+                        item.timestamp,
+                        item.sop,
+                        item.ppr,
+                        item.pdr,
+                        item.msg_type
+                    ), tags=(tag_name,))
+                except Exception:
+                    # 如果插入时 tag 出错，退回到无 tag 插入
+                    self.tree.insert('', tk.END, values=(
+                        item.index,
+                        item.timestamp,
+                        item.sop,
+                        item.ppr,
+                        item.pdr,
+                        item.msg_type
+                    ))
+            else:
+                self.tree.insert('', tk.END, values=(
+                    item.index,
+                    item.timestamp,
+                    item.sop,
+                    item.ppr,
+                    item.pdr,
+                    item.msg_type
+                ))
 
         # 恢复选中状态（如果选中的项仍然可见）。
         # 重要：不要在每次刷新时强制滚动到选中项，以免打断用户的手动滚动。
@@ -492,44 +664,44 @@ class WITRNGUI:
             info = (f"基本信息:\n序号: {item.index}\n时间: {item.timestamp}\nSOP: {item.sop}\n"
                     f"PPR: {item.ppr}\nPDR: {item.pdr}\n消息类型: {item.msg_type}\n\n详细数据:\n")
 
-            data_str = self.format_data(item.data)
+            self.data_text.insert(tk.END, info)
+            self.data_text.insert(tk.END, f"Raw: 0x{int(item.data.raw(), 2):0{int(len(item.data.raw())/4)+(1 if len(item.data.raw())%4!=0 else 0)}X}\n", 'green')
+            for value1 in item.data.value():
+                if not isinstance(value1.value(), list):
+                    self.data_text.insert(tk.END, f"{value1.field()+':':<30}")
+                    self.data_text.insert(tk.END, f"(Raw: 0x{int(value1.raw(), 2):0{int(len(value1.raw())/4)+(1 if len(value1.raw())%4!=0 else 0)}X})\n", 'green')
+                    self.data_text.insert(tk.END, f"    {value1.value()}\n")
+                else:
+                    self.data_text.insert(tk.END, f"{value1.field()+':':<30}")
+                    self.data_text.insert(tk.END, f"(Raw: 0x{int(value1.raw(), 2):0{int(len(value1.raw())/4)+(1 if len(value1.raw())%4!=0 else 0)}X})\n", 'green')
+                    for value2 in value1.value():
+                        if not isinstance(value2.value(), list):
+                            self.data_text.insert(tk.END, f"    {value2.field()}: {value2.value()}\n")
+                        else:
+                            self.data_text.insert(tk.END, f"    {value2.field()+':':<30}")
+                            self.data_text.insert(tk.END, f"(Raw: 0x{int(value2.raw(), 2):08X})\n", 'green')
+                            for value3 in value2.value():
+                                if not isinstance(value3.value(), list):
+                                    self.data_text.insert(tk.END, f"        {value3.field()}: {value3.value()}\n")
+                                else:
+                                    self.data_text.insert(tk.END, f"        {value3.field()}:\n")
+                                    for value4 in value3.value():
+                                        self.data_text.insert(tk.END, f"            {value4.field()}: {value4.value()}\n")
 
-            self.data_text.insert(tk.END, info + data_str)
         finally:
             # 设回只读，防止用户编辑
             self.data_text.config(state=tk.DISABLED)
 
-    def format_data(self, data: metadata):
-        data_str = f"Raw: 0x{int(data.raw(), 2):X}\n"
-        for value1 in data.value():
-            if not isinstance(value1.value(), list):
-                data_str += f"{value1.field()}: {value1.value()}\n"
-            else:
-                data_str += f"{value1.field()}:\n"
-                for value2 in value1.value():
-                    if not isinstance(value2.value(), list):
-                        data_str += f"    {value2.field()}: {value2.value()}\n"
-                    else:
-                        data_str += f"    {value2.field()}:\n"
-                        for value3 in value2.value():
-                            if not isinstance(value3.value(), list):
-                                data_str += f"        {value3.field()}: {value3.value()}\n"
-                            else:
-                                data_str += f"        {value3.field()}:\n"
-                                for value4 in value3.value():
-                                    data_str += f"            {value4.field()}: {value4.value()}\n"
-        return data_str
 
-    
-    def copy_data(self):
-        """复制当前显示的数据到剪贴板"""
-        if self.current_selection:
-            data = self.data_text.get(1.0, tk.END)
-            self.root.clipboard_clear()
-            self.root.clipboard_append(data)
-            self.status_var.set("数据已复制到剪贴板")
-        else:
-            messagebox.showwarning("警告", "请先选择要复制的数据项")
+    def format_data(self, data: Any) -> str:
+        """将数据格式化为用于 CSV 的字符串——按需直接使用 repr。
+        注意：用户自定义了 metadata.__repr__ 与 __str__，此处必须调用 repr。
+        """
+        try:
+            return repr(data)
+        except Exception as e:
+            # 避免退回到 str，保持显式标注错误
+            return f"<repr-error: {e}>"
 
     def export_list(self):
         """将当前数据列表导出为 CSV 文件（包含详细数据字段）"""
@@ -690,4 +862,5 @@ if __name__ == "__main__":
     # 运行GUI（如果未连接设备，GUI 仍然可运行，用户可看到错误状态并可手动重连）
     app.run()
 
-# python -m nuitka witrn_pd_sniffer_tk.py --standalone --onefile --windows-console-mode=disable --enable-plugin=tk-inter
+# Nuitka 打包示例（确保 brain.ico 被打包并供 Tk 在运行时读取）：
+# python -m nuitka witrn_pd_sniffer_tk.py --standalone --onefile --windows-console-mode=disable --enable-plugin=tk-inter --windows-icon-from-ico=brain.ico
