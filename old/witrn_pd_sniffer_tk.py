@@ -15,7 +15,7 @@ import time
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import json
-from witrnhid import WITRN_DEV, metadata
+from witrnhid import WITRN_DEV, metadata, is_pdo, is_rdo, provide_ext
 from icon import brain_ico
 
 
@@ -151,6 +151,10 @@ class WITRNGUI:
         # 控制状态
         self.is_paused = False
         self.data_collection_active = False
+        # 导入模式：当通过CSV导入数据后置True，禁止开始采集；清空后复位
+        self.import_mode = False
+        # 设备连接状态（open 成功后为 True，断开或未打开为 False）
+        self.device_open = False
         
         # 创建界面
         self.create_widgets()
@@ -320,6 +324,14 @@ class WITRNGUI:
             state=tk.DISABLED
         )
         self.export_button.pack(side=tk.LEFT, padx=(0, 10))
+
+        # 导入CSV按钮
+        self.import_button = ttk.Button(
+            data_frame,
+            text="导入CSV",
+            command=self.import_csv
+        )
+        self.import_button.pack(side=tk.LEFT, padx=(0, 10))
         
         # 清空按钮
         self.clear_button = ttk.Button(
@@ -346,13 +358,13 @@ class WITRNGUI:
         )
         self.filter_goodcrc_cb.pack(side=tk.LEFT, padx=(10, 0))
     
-    def add_data_item(self, sop: str, ppr: str, pdr: str, msg_type: str, data: Any = None, force: bool = False):
+    def add_data_item(self, sop: str, ppr: str, pdr: str, msg_type: str, data: Any = None, force: bool = False, timestamp: Optional[str] = None):
         """添加新的数据项到列表"""
         # 只有在数据收集激活且未暂停时才添加数据，除非强制添加
         if not force and (not self.data_collection_active or self.is_paused):
             return
             
-        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        timestamp = timestamp or datetime.now().strftime("%H:%M:%S.%f")[:-3]
         index = len(self.data_list) + 1
         
         item = DataItem(index, timestamp, sop, ppr, pdr, msg_type, data)
@@ -365,8 +377,15 @@ class WITRNGUI:
         """尝试重新连接设备（由 UI 按钮调用）。成功则启用开始按钮并启动数据线程。"""
         try:
             self.status_var.set("尝试连接设备...")
-            self.k2 = witrnhid.WITRN_DEV()
+            # 重新创建实例并显式打开
+            self.k2 = WITRN_DEV()
+            try:
+                self.k2.open()
+            except Exception as e:
+                raise RuntimeError(f"open() 失败: {e}")
+
             self.status_var.set("设备已连接")
+            self.device_open = True
             self.start_button.config(state=tk.NORMAL)
             # 连接成功后禁用重连按钮
             try:
@@ -400,11 +419,11 @@ class WITRNGUI:
         """内部数据收集循环；与旧的 collect_data 等价但作为实例方法使用 self.k2。"""
         while True:
             try:
-                if self.k2 is None:
-                    time.sleep(0.5)
+                if self.device_open is False:
+                    time.sleep(0.1)
                     continue
                 self.k2.read_data()
-                _, pkg = self.k2.auto_unpack()
+                timestamp, pkg = self.k2.auto_unpack()
                 if pkg.field() == "pd":
                     sop = pkg["SOP*"].value()
                     try:
@@ -420,7 +439,7 @@ class WITRNGUI:
                     except:
                         msg_type = None
                     data = pkg
-                    self.add_data_item(sop, ppr, pdr, msg_type, data)
+                    self.add_data_item(sop, ppr, pdr, msg_type, data, timestamp=timestamp)
             except Exception as e:
                 # 仅当是真正的 read error 时才视为设备断开；其他错误可能不严重
                 err_text = str(e).lower()
@@ -429,8 +448,9 @@ class WITRNGUI:
                     print(f"数据采集异常（断开）: {e}")
                     # 将设备句柄置空，停止当前数据收集状态
                     try:
-                        self.k2 = None
                         self.data_collection_active = False
+                        self.device_open = False
+                        self.k2 = WITRN_DEV()
                     except Exception:
                         pass
 
@@ -438,6 +458,7 @@ class WITRNGUI:
                     def _on_disconnect():
                         try:
                             self.status_var.set("设备断开")
+                            self.device_open = False
                             self.start_button.config(state=tk.DISABLED)
                             self.pause_button.config(state=tk.DISABLED)
                             self.reconnect_button.config(state=tk.NORMAL)
@@ -720,19 +741,175 @@ class WITRNGUI:
         try:
             with open(file_path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(['序号', '时间', 'SOP', 'PPR', 'PDR', 'Msg Type', '详细数据'])
+                writer.writerow(['序号', '时间', 'SOP', 'PPR', 'PDR', 'Msg Type', '详细数据', 'Raw'])
                 for item in self.data_list:
                     # 使用 format_data 输出的人类可读文本作为详细数据字段
                     data_text = self.format_data(item.data)
-                    writer.writerow([item.index, item.timestamp, item.sop, item.ppr, item.pdr, item.msg_type, data_text])
+                    writer.writerow([item.index,
+                                     item.timestamp,
+                                     item.sop,
+                                     item.ppr,
+                                     item.pdr,
+                                     item.msg_type,
+                                     data_text,
+                                     f"{int(item.data.raw(), 2):0{int(len(item.data.raw())/4)+(1 if len(item.data.raw())%4!=0 else 0)}X}"])
 
             self.status_var.set(f"已导出 {len(self.data_list)} 条数据 到 {file_path}")
         except Exception as e:
             messagebox.showerror("导出失败", f"导出 CSV 失败:\n{e}")
+
+    def import_csv(self):
+        """从CSV导入数据，仅解析两列：时间、Raw（全大写HEX）。
+        Raw 将被转换为长度为64字节的uint8列表（不足末尾补0，超出则截断），
+        然后使用 WITRN_DEV.auto_unpack(data) 解析并加入列表。
+        """
+        # 若正在进行数据采集（未暂停），阻止导入
+        if self.data_collection_active and not self.is_paused:
+            messagebox.showwarning("操作受限", "正在收集数据，无法导入CSV。请先暂停并清空列表后再试。")
+            return
+        file_path = filedialog.askopenfilename(
+            filetypes=[('CSV 文件', '*.csv')],
+            title='选择CSV文件'
+        )
+        if not file_path:
+            return
+
+        # 重新导入应覆盖当前列表：先静默清空
+        try:
+            self.clear_list(ask_user=False)
+        except Exception:
+            pass
+
+        # 确保有一个设备实例用于解析（仅需构造实例用于 auto_unpack，无需调用 open()）
+        try:
+            if self.k2 is None:
+                self.k2 = WITRN_DEV()
+        except Exception as e:
+            messagebox.showerror("导入失败", f"无法创建 WITRN_DEV 实例以解析CSV：\n{e}\n\n请连接设备或确保依赖可用后重试。")
+            return
+
+        success, failed = 0, 0
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                # 兼容可能的列名大小写或空格
+                col_map = {k.strip(): k for k in reader.fieldnames or []}
+                def get_col(name_alternatives):
+                    for n in name_alternatives:
+                        if n in col_map:
+                            return col_map[n]
+                    return None
+
+                time_col = get_col(["时间", "time", "Time"])
+                raw_col = get_col(["Raw", "RAW", "raw"])
+                if raw_col is None:
+                    raise ValueError("CSV中缺少列：Raw")
+                
+                last_pdo = None
+                last_rdo = None
+                last_ext = None
+
+                for row in reader:
+                    try:
+                        t_str = row[time_col].strip() if time_col and row.get(time_col) is not None else None
+                        raw_hex = (row.get(raw_col) or "").strip()
+                        if not raw_hex:
+                            failed += 1
+                            continue
+
+                        # 允许前缀0x，可选空格，统一为连续十六进制
+                        raw_hex = raw_hex.replace(" ", "").replace("0X", "0x")
+                        if raw_hex.startswith("0x"):
+                            raw_hex = raw_hex[2:]
+                        # 若为奇数长度，前置0补齐
+                        if len(raw_hex) % 2 == 1:
+                            raw_hex = '0' + raw_hex
+
+                        # 将HEX字符串转为字节数组（大写/小写均可）
+                        try:
+                            data_bytes = bytearray.fromhex(raw_hex)
+                        except Exception:
+                            failed += 1
+                            continue
+
+                        # 规范到64字节：超出则截断，不足则末尾补0
+                        if len(data_bytes) > 64:
+                            data_bytes = data_bytes[:64]
+                        elif len(data_bytes) < 64:
+                            data_bytes.extend([0] * (64 - len(data_bytes)))
+
+                        # 解析
+                        try:
+                            if self.k2 is None:
+                                # 若仍无k2，跳过解析
+                                failed += 1
+                                continue
+                            _, pkg = self.k2.auto_unpack(data_bytes, last_pdo, last_ext, last_rdo)
+                            if is_pdo(pkg):
+                                last_pdo = pkg
+                            if is_rdo(pkg):
+                                last_rdo = pkg
+                            if provide_ext(pkg):
+                                last_ext = pkg
+                            
+                        except Exception:
+                            failed += 1
+                            continue
+
+                        try:
+                            if pkg.field() == "pd":
+                                sop = pkg["SOP*"].value()
+                                try:
+                                    ppr = pkg["Message Header"][3].value()
+                                except Exception:
+                                    ppr = None
+                                try:
+                                    pdr = pkg["Message Header"][5].value()
+                                except Exception:
+                                    pdr = None
+                                try:
+                                    msg_type = pkg["Message Header"]["Message Type"].value()
+                                except Exception:
+                                    msg_type = None
+                                self.add_data_item(sop, ppr, pdr, msg_type, pkg, force=True, timestamp=t_str)
+                                success += 1
+                            else:
+                                failed += 1
+                        except Exception:
+                            failed += 1
+                            continue
+                    except Exception:
+                        failed += 1
+                        continue
+
+            # 导入完成，刷新视图
+            self.update_treeview()
+            # 启用导出按钮（若有数据）
+            try:
+                if self.data_list:
+                    self.export_button.config(state=tk.NORMAL)
+            except Exception:
+                pass
+            # 置为导入模式：设备已连接则开启“开始收集”，否则保持禁用；“暂停/恢复”重置为“暂停”并禁用
+            self.import_mode = True
+            try:
+                if getattr(self, 'device_open', False):
+                    self.start_button.config(state=tk.NORMAL)
+                else:
+                    self.start_button.config(state=tk.DISABLED)
+                self.pause_button.config(text="暂停", state=tk.DISABLED)
+            except Exception:
+                pass
+            if getattr(self, 'device_open', False):
+                self.status_var.set(f"导入完成：成功 {success} 条，失败 {failed} 条。可开始收集（会先清空）。")
+            else:
+                self.status_var.set(f"导入完成：成功 {success} 条，失败 {failed} 条。设备未连接，无法开始收集；请先连接设备。")
+        except Exception as e:
+            messagebox.showerror("导入失败", f"无法导入CSV:\n{e}")
     
-    def clear_list(self):
-        """清空数据列表"""
-        if messagebox.askyesno("确认", "确定要清空所有数据吗？"):
+    def clear_list(self, ask_user: bool = True):
+        """清空数据列表，并重置导入模式。"""
+        if (not ask_user) or messagebox.askyesno("确认", "确定要清空所有数据吗？"):
             self.data_list.clear()
             self.current_selection = None
             self.update_treeview()
@@ -746,10 +923,45 @@ class WITRNGUI:
                 self.export_button.config(state=tk.DISABLED)
             except Exception:
                 pass
+            # 退出导入模式
+            self.import_mode = False
+            # 如果当前处于正常采集状态（且未暂停），不更改开始/暂停按钮状态
+            if not (self.data_collection_active and not self.is_paused):
+                # 根据设备连接状态控制“开始收集”可用性，并重置暂停按钮
+                try:
+                    if getattr(self, 'device_open', False):
+                        self.start_button.config(state=tk.NORMAL)
+                    else:
+                        self.start_button.config(state=tk.DISABLED)
+                    # 清空后恢复暂停按钮默认状态（未收集时禁用）
+                    self.pause_button.config(state=tk.DISABLED, text="暂停")
+                except Exception:
+                    pass
             self.status_var.set("列表已清空")
     
     def start_collection(self):
         """开始数据收集"""
+        # 未连接设备（未 open）时不允许开始
+        if not getattr(self, 'device_open', False):
+            messagebox.showwarning("设备未连接", "未检测到已连接的设备。请先连接设备后再开始收集。")
+            return
+        # 导入模式时需清空后才能开始
+        if self.import_mode:
+            if not self.data_list:
+                # 仅有标志位，防御性复位
+                self.import_mode = False
+            else:
+                if messagebox.askyesno("清空后开始", "当前列表来自CSV导入，须清空后才能开始收集。是否清空并开始？"):
+                    self.clear_list(ask_user=False)
+                else:
+                    return
+
+        # 如果列表非空且不是导入模式，也询问是否清空以保持干净数据
+        if self.data_list:
+            if not messagebox.askyesno("清空后开始", "开始收集前建议清空现有列表。是否清空并开始？"):
+                return
+            self.clear_list(ask_user=False)
+
         self.data_collection_active = True
         self.is_paused = False
         self.start_button.config(state=tk.DISABLED)
@@ -804,57 +1016,54 @@ class WITRNGUI:
 
 
 if __name__ == "__main__":
-    import witrnhid
     import threading
     
     # 创建并运行GUI
     app = WITRNGUI()
     
-    # 尝试创建WITRN设备，如果无法打开则弹窗并退出
+    # 创建实例并尝试打开设备；失败时保留GUI并允许手动重连
+    k2 = None
     try:
         k2 = WITRN_DEV()
-        app.k2 = k2
-        # 启用开始按钮（如果之前被禁用）
         try:
-            app.start_button.config(state=tk.NORMAL)
-            app.status_var.set("设备已连接")
+            k2.open()
+            app.k2 = k2
+            app.device_open = True
+            # 启用开始按钮（如果之前被禁用）
             try:
-                app.reconnect_button.config(state=tk.DISABLED)
+                app.start_button.config(state=tk.NORMAL)
+                app.status_var.set("设备已连接")
+                try:
+                    app.reconnect_button.config(state=tk.DISABLED)
+                except Exception:
+                    pass
+                try:
+                    app.pause_button.config(text="暂停", state=tk.DISABLED)
+                except Exception:
+                    pass
             except Exception:
                 pass
+        except Exception as e:
+            # open 失败
+            messagebox.showerror("错误", f"无法连接到K2 (open失败):\n{e}")
             try:
-                app.pause_button.config(text="暂停", state=tk.DISABLED)
+                app.status_var.set("无法连接到K2")
+                app.start_button.config(state=tk.DISABLED)
+                app.device_open = False
             except Exception:
                 pass
-        except Exception:
-            pass
+            # 保留未打开的实例用于离线解析（如导入CSV）
+            app.k2 = k2
     except Exception as e:
-        # 使用 messagebox 提示错误（app.root 已存在）但保留 GUI，允许手动重试
-        messagebox.showerror("错误", f"无法连接到K2:\n{e}")
-        # 更新状态并禁用开始按钮
+        # 构造失败
+        messagebox.showerror("错误", f"无法创建K2实例:\n{e}")
         try:
             app.status_var.set("无法连接到K2")
             app.start_button.config(state=tk.DISABLED)
+            app.device_open = False
         except Exception:
             pass
         k2 = None
-    
-    def collect_data():
-        """数据收集函数"""
-        while True:
-            try:
-                k2.read_data()
-                _, pkg = k2.auto_unpack()
-                if pkg.field() == "pd":
-                    sop = pkg["SOP*"].value()
-                    ppr = pkg["Message Header"][3].value()
-                    pdr = pkg["Message Header"][5].value()
-                    msg_type = pkg["Message Header"]["Message Type"].value()
-                    data = pkg
-                    app.add_data_item(sop, ppr, pdr, msg_type, data)
-            except Exception as e:
-                pass
-            
     
     # 启动数据收集线程（如果设备已连接，方法内部会避免重复启动）
     app.start_data_thread_if_needed()
