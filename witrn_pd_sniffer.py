@@ -9,6 +9,7 @@ from tkinter import ttk, scrolledtext, messagebox, filedialog
 import os
 import base64
 import tempfile
+import ctypes
 import csv
 import threading
 import time
@@ -16,6 +17,16 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from witrnhid import WITRN_DEV, metadata, is_pdo, is_rdo, provide_ext
 from icon import brain_ico
+from collections import deque
+import multiprocessing
+from multiprocessing import Process, Queue, Event, Value
+import queue
+
+# 强制导入 matplotlib（环境已保证存在）
+import matplotlib
+matplotlib.use('TkAgg')  # 必须在导入 pyplot 之前设置
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.pyplot as plt
 
 
 MT = {
@@ -79,6 +90,168 @@ MT = {
 }
 
 
+# ==================== 数据采集进程函数 ====================
+def data_collection_worker(data_queue, iv_queue, stop_event, pause_flag):
+    """
+    独立的数据采集进程
+    
+    Args:
+        data_queue: PD数据队列（发送给主进程）
+        iv_queue: 电参数据队列（发送给主进程）- 包含plot和iv_info数据
+        stop_event: 停止信号
+        pause_flag: 暂停标志（0=收集中, 1=暂停）
+    """
+    k2 = WITRN_DEV()
+    last_pdo = None
+    last_rdo = None
+    last_general_timestamp = 0.0
+    
+    try:
+        k2.open()
+        
+        while not stop_event.is_set():
+            try:
+                # 读取数据（不管是否暂停都读取，避免缓冲区堆积）
+                k2.read_data()
+                timestamp_str, pkg = k2.auto_unpack()
+                current_time = time.time()
+                
+                if pkg.field() == "general":
+                    # general包始终处理（用于iv_info和plot），不受暂停影响
+                    # 提取电参数据
+                    try:
+                        current = float(pkg["Current"].value()[:-1])
+                    except:
+                        current = 0.0
+                    try:
+                        voltage = float(pkg["VBus"].value()[:-1])
+                    except:
+                        voltage = 0.0
+                    try:
+                        power = abs(current * voltage)
+                    except:
+                        power = 0.0
+                    try:
+                        cc1 = float(pkg["CC1"].value()[:-1])
+                    except:
+                        cc1 = 0.0
+                    try:
+                        cc2 = float(pkg["CC2"].value()[:-1])
+                    except:
+                        cc2 = 0.0
+                    try:
+                        dp = float(pkg["D+"].value()[:-1])
+                    except:
+                        dp = 0.0
+                    try:
+                        dn = float(pkg["D-"].value()[:-1])
+                    except:
+                        dn = 0.0
+                    
+                    now = time.time()
+                    
+                    # 发送电参数据（非阻塞）
+                    # 包含两个标志：update_plot（总是True）和 update_iv_info（根据频率限制）
+                    update_iv_info = (now - last_general_timestamp >= 0.1)  # 10Hz限制
+                    
+                    try:
+                        iv_queue.put_nowait({
+                            'timestamp': current_time,
+                            'voltage': voltage,
+                            'current': current,
+                            'power': power,
+                            'cc1': cc1,
+                            'cc2': cc2,
+                            'dp': dp,
+                            'dn': dn,
+                            'update_plot': True,          # plot数据点无限制
+                            'update_iv_info': update_iv_info  # iv_info限制在10Hz
+                        })
+                    except queue.Full:
+                        pass  # 队列满时丢弃旧数据
+                    
+                    if update_iv_info:
+                        last_general_timestamp = now
+                    
+                elif pkg.field() == "pd":
+                    # PD包只在未暂停时处理
+                    if pause_flag.value == 1:
+                        continue  # 暂停时跳过PD数据
+                    
+                    # 提取PD数据
+                    sop = pkg["SOP*"].value()
+                    try:
+                        rev = pkg["Message Header"][4].value()[4:]
+                    except:
+                        rev = None
+                    try:
+                        ppr = pkg["Message Header"][3].value()
+                        if ppr == 'rved':
+                            ppr = None
+                    except:
+                        ppr = None
+                    try:
+                        pdr = pkg["Message Header"][5].value()
+                    except:
+                        pdr = None
+                    try:
+                        msg_type = pkg["Message Header"]["Message Type"].value()
+                    except:
+                        msg_type = None
+                    
+                    is_pdo_flag = is_pdo(pkg)
+                    is_rdo_flag = is_rdo(pkg)
+                    
+                    if is_pdo_flag:
+                        last_pdo = pkg
+                    if is_rdo_flag:
+                        last_rdo = pkg
+                    
+                    # 发送PD数据（非阻塞）
+                    try:
+                        data_queue.put_nowait({
+                            'timestamp': timestamp_str,
+                            'time_sec': current_time,
+                            'sop': sop,
+                            'rev': rev,
+                            'ppr': ppr,
+                            'pdr': pdr,
+                            'msg_type': msg_type,
+                            'data': pkg,
+                            'is_pdo': is_pdo_flag,
+                            'is_rdo': is_rdo_flag,
+                            'last_pdo': last_pdo,
+                            'last_rdo': last_rdo
+                        })
+                    except queue.Full:
+                        pass  # 队列满时丢弃旧数据
+                        
+            except Exception as e:
+                err_text = str(e).lower()
+                if 'read error' in err_text:
+                    # 设备断开，发送错误信号
+                    try:
+                        data_queue.put_nowait({'error': 'device_disconnected'})
+                    except:
+                        pass
+                    break
+                else:
+                    # 其他错误继续
+                    time.sleep(0.01)
+                    
+    except Exception as e:
+        # 连接失败
+        try:
+            data_queue.put_nowait({'error': f'connection_failed: {e}'})
+        except:
+            pass
+    finally:
+        try:
+            k2.close()
+        except:
+            pass
+
+
 class DataItem:
     """数据项类，表示列表中的一行数据"""
     def __init__(self, index: int, timestamp: str, sop: str, rev: str, ppr: str, pdr: str, msg_type: str, data: Any = None):
@@ -89,7 +262,7 @@ class DataItem:
         self.ppr = ppr
         self.pdr = pdr
         self.msg_type = msg_type
-        self.data = data or {}
+        self.data = data or metadata()
 
 
 class WITRNGUI:
@@ -102,7 +275,7 @@ class WITRNGUI:
             self.root.withdraw()
         except Exception:
             pass
-        self.root.title("WITRN PD Sniffer v3.1 by JohnScotttt")
+        self.root.title("WITRN PD Sniffer v3.4 by JohnScotttt")
         # 使用内置的 base64 图标（brain_ico）设置窗口图标；失败则回退到本地 brain.ico
         try:
             ico_bytes = base64.b64decode(brain_ico)
@@ -153,6 +326,14 @@ class WITRNGUI:
         self.import_mode = False
         self.device_open = False
         
+        # Treeview刷新优化
+        self.last_treeview_update_time = 0.0  # 上次刷新时间
+        self.pending_treeview_update = False   # 是否有待处理的刷新
+        self.last_rendered_count = 0           # 上次渲染的数据条数
+        self.treeview_update_job = None        # 定时刷新任务ID
+        self.last_relative_time_mode = False   # 跟踪上次的相对时间模式
+        self.last_filter_goodcrc_mode = False  # 跟踪上次的过滤模式
+        
         # 创建界面
         self.create_widgets()
         
@@ -160,10 +341,71 @@ class WITRNGUI:
         self.refresh_thread = threading.Thread(target=self.refresh_data_loop, daemon=True)
         self.refresh_thread.start()
 
-        self.k2 = WITRN_DEV()
+        # 解析器实例（仅用于离线/CSV 数据解析，不负责设备连接）
+        self.parser = WITRN_DEV()
+        # 连接确认等待标志：启动子进程后，直到收到第一条数据才算真正“已连接”
+        self.awaiting_connection_ack = False
+        # 若用户在等待连接过程中按下“开始”（或 F5），连接成功后自动开始收集
+        self.autostart_after_connect = False
         self.data_thread_started = False
         self.last_pdo = None
         self.last_rdo = None
+        
+        # ===== 多进程相关 =====
+        self.collection_process = None
+        self.data_queue = None  # PD数据队列
+        self.iv_queue = None    # 电参数据队列
+        self.stop_event = None
+        self.pause_flag = None  # 共享值：0=收集中, 1=暂停
+        self.queue_consumer_thread = None  # 消费队列数据的线程
+        self.queue_consumer_running = False  # 消费线程运行标志
+
+        # 彩蛋：全局键入“brain”触发
+        self._egg_secret = "brain"
+        self._egg_buffer = ""
+        self._egg_activated = False
+        # 彩蛋-顶部水平容器与右侧电参信息面板
+        self.egg_top_row = None
+        self.iv_info_frame = None
+        self.iv_info_label = None
+        self.iv_labels = {}
+        # 每个电参标签的固定字符宽度（可按需单独调整）
+        self.iv_label_char_widths = {
+            'current': 12,
+            'voltage': 12,
+            'power': 12,
+            'cc1': 12,
+            'cc2': 12,
+            'dp': 12,
+            'dn': 12,
+        }
+        # 电参信息缓存（在未激活彩蛋前可先写入）
+        self._iv_info_cached = {
+            'current': '-',  # 电流
+            'voltage': '-',  # 电压
+            'power': '-',    # 功率
+            'cc1': '-',      # CC1
+            'cc2': '-',      # CC2
+            'dp': '-',       # D+
+            'dn': '-',       # D-
+        }
+        self.last_general_timestamp = 0.0
+        try:
+            # 监听全局按键（窗口任何位置）
+            self.root.bind_all('<Key>', self._on_global_keypress, add='+')
+            # 绑定 F5：未连接则自动连接并开始，已连接则开始收集
+            self.root.bind_all('<F5>', self._on_f5_press, add='+')
+            # 绑定 Shift+F5：断开连接
+            self.root.bind_all('<Shift-F5>', self._on_shift_f5_press, add='+')
+        except Exception:
+            pass
+
+        # 在 Windows 上尝试禁用 IME，使窗口内控件仅产生直接按键（等效锁定英文输入）
+        try:
+            self._install_disable_ime_hooks()
+        except Exception:
+            # 失败不影响主流程
+            pass
 
         # 所有初始化完成后再显示窗口，减少启动闪烁
         try:
@@ -181,6 +423,8 @@ class WITRNGUI:
         
         # 左侧列表框架
         left_frame = ttk.Frame(main_frame)
+        # 保存引用，供彩蛋在最上方插入控件
+        self.left_frame = left_frame
         # 固定左侧宽度为750，并禁止根据子控件自动调整大小
         left_frame.configure(width=750)
         try:
@@ -193,6 +437,8 @@ class WITRNGUI:
 
         # 按钮与数据操作区（移动到左侧）
         button_frame = ttk.Frame(left_frame)
+        # 保存引用，供彩蛋插入控件时控制相对位置
+        self.button_frame = button_frame
         button_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
 
         # 屏蔽GoodCRC 复选框（与按钮同一层级，靠右）
@@ -374,6 +620,8 @@ class WITRNGUI:
             pass
         # 仅纵向扩展，宽度固定
         right_frame.pack(side=tk.RIGHT, fill=tk.Y, expand=True, padx=(5, 0))
+        # 保存引用，供彩蛋绘图在其下方插入曲线区
+        self.right_frame = right_frame
         
         # 数据文本显示区域
         self.data_text = scrolledtext.ScrolledText(
@@ -384,7 +632,8 @@ class WITRNGUI:
             font=('Consolas', 10),
             state=tk.DISABLED  # 初始为只读
         )
-        self.data_text.pack(fill=tk.BOTH, expand=True)
+        # 让文本区域位于上方，留出底部空间用于后续插入曲线
+        self.data_text.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         # 注册颜色标签（Text widget 使用 tag 来控制文本样式）
         try:
             self.data_text.config(selectbackground="#b4d9fb", selectforeground="black")
@@ -436,16 +685,672 @@ class WITRNGUI:
         except Exception:
             pass
 
+        # ===== 彩蛋曲线相关（延迟初始化） =====
+        self.plot_group = None            # LabelFrame 容器
+        self.plot_container = None        # 固定高度的承载容器
+        self.plot_canvas = None           # FigureCanvasTkAgg
+        self.plot_fig = None              # matplotlib Figure
+        self.plot_ax_v = None             # 电压轴（左）
+        self.plot_ax_i = None             # 电流轴（右）
+        self._plot_lock = threading.Lock()
+        self.plot_times = deque(maxlen=60000)     # 时间戳（秒）
+        self.plot_voltage = deque(maxlen=60000)   # 电压 V
+        self.plot_current = deque(maxlen=60000)   # 电流 A
+        self.plot_update_job = None
+        self.plot_update_interval_ms = 500
+        self.plot_window_seconds = 60.0          # 默认显示最近60秒
+        self.plot_latest_time = 0.0              # 最新数据的时间戳
+        self.plot_start_time = None              # 数据采集开始时间
+        # 事件标记（PDO/RDO）
+        self.marker_events = deque(maxlen=3600)  # (timestamp_sec, kind: 'pdo'|'rdo')
+        self._marker_artists = []  # 兼容旧逻辑：绘制时生成的 vline 句柄
+        # 新增：为事件建立 artist 映射，避免重复创建，并支持保留历史
+        self._marker_artists_map = {}  # key: (x, kind) -> artist
+        self.keep_marker_history = True  # 为 True 时，PDO/RDO 标线在历史中保留
+
+    def _on_global_keypress(self, event: tk.Event) -> None:
+        """捕获全局键盘输入，用于检测彩蛋口令。"""
+        if self._egg_activated:
+            return
+        try:
+            ch = event.char or ''
+        except Exception:
+            ch = ''
+
+        # 仅处理可见 ASCII 字符；退格清空缓冲以避免误触
+        if event.keysym in ('BackSpace', 'Escape'):
+            self._egg_buffer = ''
+            return
+        if len(ch) != 1 or not (32 <= ord(ch) <= 126):
+            return
+
+        # 追加并截断到口令长度
+        self._egg_buffer = (self._egg_buffer + ch).lower()[-len(self._egg_secret):]
+        if self._egg_buffer == self._egg_secret:
+            self._egg_buffer = ''
+            self._activate_easter_egg()
+
+    def _on_f5_press(self, event: Optional[tk.Event] = None):
+        """F5 快捷：
+        - 未连接设备 -> 尝试连接设备，连接成功后开始收集。
+        - 已连接设备 -> 若处于暂停，则开始收集；若已在收集则忽略。
+        """
+        try:
+            # 若按下了 Shift，则交由 Shift+F5 处理
+            if event is not None and (getattr(event, 'state', 0) & 0x0001):
+                return None
+            # 未连接：尝试连接
+            if not self.device_open:
+                self.connect_device()
+                # 若连接成功，开始收集（避免阻塞提示后的状态不一致）
+                if self.device_open and self.is_paused:
+                    self.pause_collection()
+                return 'break'
+
+            # 已连接：如处于暂停则开始
+            if self.is_paused:
+                self.pause_collection()
+            return 'break'
+        except Exception:
+            # 无论如何拦截默认行为，避免触发其他绑定
+            return 'break'
+
+    def _on_shift_f5_press(self, event: Optional[tk.Event] = None):
+        """Shift+F5：断开连接（若当前已连接）。"""
+        try:
+            if self.device_open:
+                # 复用切换逻辑（已连接时 connect_device 会执行断开路径）
+                self.connect_device()
+            else:
+                self.set_status("未连接设备", level='info')
+            return 'break'
+        except Exception:
+            return 'break'
+
+    def _activate_easter_egg(self) -> None:
+        """激活开发者界面：在左边框架最上方添加设备菜单（下拉，内容暂为空）。"""
+        if self._egg_activated:
+            return
+        self._egg_activated = True
+        try:
+            # 1) 顶部水平容器：放置“设备列表”与“基本信息”并排
+            if self.egg_top_row is None or not str(self.egg_top_row):
+                self.egg_top_row = ttk.Frame(self.left_frame)
+                try:
+                    self.egg_top_row.pack(side=tk.TOP, fill=tk.X, pady=(0, 8), before=self.button_frame)
+                except Exception:
+                    self.egg_top_row.pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
+                    try:
+                        self.button_frame.pack_forget()
+                        self.button_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
+                    except Exception:
+                        pass
+
+            # 3) 在设备列表右侧创建“基本信息”面板
+            if self.iv_info_frame is None or getattr(self.iv_info_frame, 'master', None) is not self.egg_top_row:
+                try:
+                    if self.iv_info_frame is not None:
+                        self.iv_info_frame.destroy()
+                except Exception:
+                    pass
+                self.iv_info_frame = ttk.LabelFrame(self.egg_top_row, text="基本信息", padding=8)
+                # 右侧面板占据剩余空间，并按Y方向填充与左侧保持同高
+                self.iv_info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 0))
+                # 放置7个横向标签（电流、电压、功率、CC1、CC2、D+、D-）
+                try:
+                    for child in getattr(self.iv_info_frame, 'winfo_children', lambda: [])():
+                        try:
+                            child.destroy()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                self.iv_labels = {}
+                display_names = {
+                    'current': '电流',
+                    'voltage': '电压',
+                    'power': '功率',
+                    'cc1': 'CC1',
+                    'cc2': 'CC2',
+                    'dp': 'D+',
+                    'dn': 'D-',
+                }
+                order = ['current', 'voltage', 'power', 'cc1', 'cc2', 'dp', 'dn']
+                for key in order:
+                    text = f"{display_names[key]}: {self._iv_info_cached.get(key, '-')}"
+                    width = int(self.iv_label_char_widths.get(key, 16))
+                    lbl = ttk.Label(self.iv_info_frame, text=text, anchor='w', justify='left', width=width)
+                    lbl.pack(side=tk.LEFT, padx=(0, 2))
+                    self.iv_labels[key] = lbl
+
+            # 4) 首次激活后，用缓存的电参信息刷新显示
+            try:
+                self._refresh_iv_label_async()
+            except Exception:
+                pass
+            # 5) 初始化并显示电压/电流曲线区（在右侧“数据显示”下方）
+            try:
+                self._ensure_plot_initialized()
+            except Exception:
+                pass
+            # 反馈状态
+            try:
+                self.set_status("开发者模式已开启", level='egg')
+            except Exception:
+                pass
+        except Exception:
+            # 激活失败不影响主流程
+            try:
+                self.set_status("彩蛋激活失败", level='warn')
+            except Exception:
+                pass
+
+    # ===== Windows IME 禁用（方式二）=====
+    def _disable_ime_for_hwnd(self, hwnd: int) -> None:
+        """对指定 HWND 禁用 IME（ImmAssociateContext(hwnd, NULL)）。仅 Windows 生效。"""
+        try:
+            if os.name != 'nt' or not hwnd:
+                return
+            imm32 = ctypes.windll.imm32  # type: ignore[attr-defined]
+            # 直接传入空指针，解除该窗口的 IME 关联
+            imm32.ImmAssociateContext(ctypes.c_void_p(hwnd), ctypes.c_void_p(0))
+        except Exception:
+            pass
+
+    def _install_disable_ime_hooks(self) -> None:
+        """为整个应用安装 IME 禁用钩子：
+        - 当前窗口与其获得焦点的子控件会被禁用 IME，达到“锁定英文输入”的效果。
+        - 仅在 Windows 上启用；其他平台忽略。
+        """
+        if os.name != 'nt':
+            return
+
+        # 先对顶层窗口禁用一次 IME
+        try:
+            self._disable_ime_for_hwnd(int(self.root.winfo_id()))
+        except Exception:
+            pass
+
+        # 焦点切换时，对获得焦点的控件禁用 IME（覆盖后续创建的控件）
+        def _on_focus_in(e: tk.Event):
+            try:
+                w = getattr(e, 'widget', None)
+                if w is None:
+                    return
+                hwnd = int(w.winfo_id())
+                self._disable_ime_for_hwnd(hwnd)
+            except Exception:
+                pass
+
+        try:
+            self.root.bind_all('<FocusIn>', _on_focus_in, add='+')
+        except Exception:
+            pass
+
+    def _refresh_iv_label_async(self):
+        """异步刷新右侧电参标签的内容，保证在主线程更新。"""
+        try:
+            self.root.after(0, self._refresh_iv_label_now)
+        except Exception:
+            # 兜底：直接尝试更新
+            self._refresh_iv_label_now()
+
+    def _refresh_iv_label_now(self):
+        try:
+            if isinstance(self.iv_labels, dict) and self.iv_labels:
+                display_names = {
+                    'current': '电流',
+                    'voltage': '电压',
+                    'power': '功率',
+                    'cc1': 'CC1',
+                    'cc2': 'CC2',
+                    'dp': 'D+',
+                    'dn': 'D-',
+                }
+                for key, lbl in list(self.iv_labels.items()):
+                    try:
+                        if lbl is not None:
+                            lbl.config(text=f"{display_names.get(key, key)}: {self._iv_info_cached.get(key, '-')} ")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def reset_iv_info(self) -> None:
+        """将“基本信息”面板恢复为初始状态（全部为 '-'）。"""
+        try:
+            self._iv_info_cached.update({
+                'current': '-',
+                'voltage': '-',
+                'power': '-',
+                'cc1': '-',
+                'cc2': '-',
+                'dp': '-',
+                'dn': '-',
+            })
+        except Exception:
+            pass
+        try:
+            if self._egg_activated:
+                self._refresh_iv_label_async()
+        except Exception:
+            pass
+
+    def set_iv_info(self, current: str, voltage: str, power: str, cc1: str, cc2: str, dp: str, dn: str) -> None:
+        """更新“基本信息”面板内容（全部为 str）。
+        即使彩蛋未激活也会先缓存，待激活后自动渲染。
+        """
+        # 写入缓存
+        try:
+            self._iv_info_cached.update({
+                'current': str(current),
+                'voltage': str(voltage),
+                'power': str(power),
+                'cc1': str(cc1),
+                'cc2': str(cc2),
+                'dp': str(dp),
+                'dn': str(dn),
+            })
+        except Exception:
+            # 即使 update 失败，也不要抛出到调用方
+            pass
+        # 如果彩蛋已激活，刷新 UI；否则保持缓存
+        if self._egg_activated:
+            self._refresh_iv_label_async()
+
+    # ===== 曲线绘图支持 =====
+    def _ensure_plot_initialized(self):
+        """在右侧数据显示区域底部初始化曲线LabelFrame与matplotlib画布。"""
+        # 若缺少 matplotlib，放置提示标签
+        if self.plot_group is not None and str(self.plot_group):
+            return
+        
+        # 设置matplotlib的后端参数，优化性能
+        plt.rcParams['path.simplify'] = True
+        plt.rcParams['path.simplify_threshold'] = 1.0
+        plt.rcParams['agg.path.chunksize'] = 10000
+        if getattr(self, 'right_frame', None) is None:
+            return
+        self.plot_group = ttk.LabelFrame(self.right_frame, text="电流/电压 曲线", padding=6)
+        # 放在底部，不参与 expand（保持固定高度）
+        try:
+            self.plot_group.pack(side=tk.BOTTOM, fill=tk.X, expand=False, pady=(8, 0))
+        except Exception:
+            self.plot_group.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+
+        # 承载画布的容器，固定高度，防止与上方文本竞争空间
+        self.plot_container = tk.Frame(self.plot_group, height=260)
+        try:
+            self.plot_container.pack_propagate(False)
+        except Exception:
+            pass
+        self.plot_container.pack(side=tk.TOP, fill=tk.X)
+
+        # 初始化 Figure/Axes（双Y轴：左电压V，右电流A）
+        self.plot_fig = plt.Figure(figsize=(7.8, 2.2), dpi=100)
+        self.plot_ax_v = self.plot_fig.add_subplot(111)
+        try:
+            self.plot_ax_i = self.plot_ax_v.twinx()
+        except Exception:
+            self.plot_ax_i = None
+
+        self.plot_ax_v.set_ylabel("VBus (V)", color="#1f77b4")
+        if self.plot_ax_i is not None:
+            self.plot_ax_i.set_ylabel("Current (A)", color="#d62728")
+
+        # 预置两条线对象
+        self._line_v, = self.plot_ax_v.plot([], [], color="#1f77b4", linewidth=1.5, label="VBus")
+        if self.plot_ax_i is not None:
+            self._line_i, = self.plot_ax_i.plot([], [], color="#d62728", linewidth=1.3, label="Current")
+        else:
+            self._line_i, = self.plot_ax_v.plot([], [], color="#d62728", linewidth=1.3, label="Current")
+
+        try:
+            self.plot_ax_v.grid(True, linestyle='--', alpha=0.3)
+        except Exception:
+            pass
+        try:
+            handles = [self._line_v]
+            if self._line_i is not None:
+                handles.append(self._line_i)
+            labels = [h.get_label() for h in handles]
+            ax_for_legend = self.plot_ax_i if self.plot_ax_i is not None else self.plot_ax_v
+            legend = ax_for_legend.legend(handles, labels, loc='upper left')
+            try:
+                legend.set_zorder(10)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # 优化布局，避免右侧 Y 轴标签被裁剪
+        try:
+            self.plot_fig.tight_layout()
+        except Exception:
+            pass
+
+        # 嵌入 Tk 画布
+        try:
+            self.plot_canvas = FigureCanvasTkAgg(self.plot_fig, master=self.plot_container)
+            self.plot_canvas_widget = self.plot_canvas.get_tk_widget()
+            self.plot_canvas_widget.pack(fill=tk.BOTH, expand=True)
+
+            # 创建自定义 matplotlib 工具栏（不显示 Configure subplots）
+            from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+            class CustomToolbar(NavigationToolbar2Tk):
+                # 只保留需要的按钮
+                toolitems = [t for t in NavigationToolbar2Tk.toolitems if t[0] != 'Subplots']
+            
+            self.plot_toolbar = CustomToolbar(self.plot_canvas, self.plot_container)
+            self.plot_toolbar.update()  # 更新工具栏
+            # 初始状态根据设备连接状态决定是否显示工具栏
+            if self.device_open:
+                try:
+                    self._deactivate_plot_interactions()
+                finally:
+                    self.plot_toolbar.pack_forget()
+            else:
+                self.plot_toolbar.pack(side=tk.TOP, fill=tk.X)
+            self.plot_canvas._tkcanvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        except Exception:
+            # 若画布创建失败，给出提示
+            try:
+                for w in self.plot_container.winfo_children():
+                    w.destroy()
+            except Exception:
+                pass
+            tk.Label(self.plot_container, text="创建绘图画布失败", fg="#a4262c").pack(fill=tk.BOTH, expand=True)
+            return
+
+        # 启动定时刷新
+        if self.plot_update_job is None:
+            self._schedule_plot_update()
+
+    def _schedule_plot_update(self):
+        try:
+            self.plot_update_job = self.root.after(self.plot_update_interval_ms, self._update_plot)
+        except Exception:
+            self.plot_update_job = None
+
+    def _deactivate_plot_interactions(self) -> None:
+        """取消 Matplotlib 工具栏的抓手（Pan/Zoom）模式，恢复默认光标。
+        在隐藏工具栏或切换设备状态时调用，避免画布仍处于拖拽/缩放模式。
+        """
+        try:
+            tb = getattr(self, 'plot_toolbar', None)
+            if not tb:
+                return
+            # 依据不同版本实现，尽量安全地关闭活动模式
+            try:
+                active = getattr(tb, '_active', None)
+            except Exception:
+                active = None
+            # 主动切换一次以关闭对应模式（pan/zoom 都是切换式）
+            try:
+                if active == 'PAN' and hasattr(tb, 'pan'):
+                    tb.pan()
+                elif active == 'ZOOM' and hasattr(tb, 'zoom'):
+                    tb.zoom()
+            except Exception:
+                pass
+            # 双保险：直接清空内部标志与模式文本
+            try:
+                if hasattr(tb, '_active'):
+                    tb._active = None
+            except Exception:
+                pass
+            try:
+                if getattr(tb, 'mode', None):
+                    tb.mode = ''
+            except Exception:
+                pass
+            # 恢复画布默认光标
+            try:
+                canvas = getattr(self, 'plot_canvas', None)
+                if canvas is not None:
+                    w = canvas.get_tk_widget()
+                    try:
+                        w.configure(cursor='')
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            # 任意异常不影响主流程
+            pass
+    
+    def _stop_plot_updates(self):
+        """停止曲线的定时刷新。"""
+        try:
+            if self.plot_update_job is not None:
+                try:
+                    self.root.after_cancel(self.plot_update_job)
+                except Exception:
+                    pass
+                self.plot_update_job = None
+        except Exception:
+            pass
+
+    def _start_plot_updates(self):
+        """启动曲线的定时刷新（若未启动）。"""
+        try:
+            if self.plot_update_job is None:
+                self._schedule_plot_update()
+        except Exception:
+            pass
+
+    def _reset_plot(self):
+        """清空缓冲并重置坐标轴与线条，作为连接设备时的初始化。"""
+        try:
+            with self._plot_lock:
+                try:
+                    self.plot_times.clear()
+                    self.plot_voltage.clear()
+                    self.plot_current.clear()
+                    self.plot_start_time = None  # 重置起始时间
+                except Exception:
+                    # 若 deque 不存在或已被销毁，忽略
+                    pass
+            # 线条清空
+            try:
+                if hasattr(self, '_line_v') and self._line_v is not None:
+                    self._line_v.set_data([], [])
+            except Exception:
+                pass
+            try:
+                if hasattr(self, '_line_i') and self._line_i is not None:
+                    self._line_i.set_data([], [])
+            except Exception:
+                pass
+            # 清空事件标记与已绘制的标记线
+            try:
+                with self._plot_lock:
+                    self.marker_events.clear()
+            except Exception:
+                pass
+            # 彻底移除已创建的 artist（兼容旧列表与新映射）
+            try:
+                for a in (getattr(self, '_marker_artists', []) or []):
+                    try:
+                        a.remove()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                self._marker_artists = []
+            try:
+                for k, a in list((getattr(self, '_marker_artists_map', {}) or {}).items()):
+                    try:
+                        a.remove()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                self._marker_artists_map = {}
+            # 坐标轴复位
+            try:
+                if self.plot_ax_v is not None:
+                    self.plot_ax_v.set_xlim(0, self.plot_window_seconds)
+                    # 设定一个合理的初始电压范围（0~25V）
+                    self.plot_ax_v.set_ylim(0, 25)
+            except Exception:
+                pass
+            try:
+                if self.plot_ax_i is not None:
+                    # 初始电流范围（0~5A）
+                    self.plot_ax_i.set_ylim(0, 5)
+            except Exception:
+                pass
+            # 立即刷新一次
+            try:
+                if self.plot_canvas is not None:
+                    self.plot_canvas.draw_idle()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _append_plot_point(self, t_sec: float, v: float, i: float):
+        try:
+            with self._plot_lock:
+                # 设置起始时间（如果还未设置）
+                if self.plot_start_time is None:
+                    self.plot_start_time = t_sec
+                # 计算相对时间（从数据开始采集时算起）
+                rel_time = t_sec - self.plot_start_time
+                self.plot_times.append(rel_time)
+                self.plot_voltage.append(float(v))
+                self.plot_current.append(float(i))
+        except Exception:
+            pass
+
+    def _append_marker_event(self, t_sec: float, kind: str):
+        """记录一个事件标记（PDO/RDO）。kind 取 'pdo' 或 'rdo'。"""
+        try:
+            if kind not in ('pdo', 'rdo'):
+                return
+            with self._plot_lock:
+                # 使用相对时间记录事件
+                if self.plot_start_time is not None:
+                    rel_time = float(t_sec) - self.plot_start_time
+                    self.marker_events.append((rel_time, kind))
+        except Exception:
+            pass
+
+    def _update_plot(self):
+        try:
+            if self.plot_canvas is None or self.plot_ax_v is None:
+                return
+            
+            with self._plot_lock:
+                if not self.plot_times:
+                    return
+                    
+                # 获取所有数据
+                t_max = max(self.plot_times)
+                # 始终显示最新的60秒数据
+                t_min = t_max - float(self.plot_window_seconds)
+                
+                # 直接使用实际时间值，不再转换为相对值
+                xs = list(self.plot_times)
+                vs = list(self.plot_voltage)
+                is_ = list(self.plot_current)
+
+            # 更新数据
+            self._line_v.set_data(xs, vs)
+            if self.plot_ax_i is not None:
+                self._line_i.set_data(xs, is_)
+            else:
+                self._line_i.set_data(xs, is_)
+
+            # 更新时间轴范围
+            try:
+                # 显示实际时间范围，保持60秒的窗口宽度
+                self.plot_ax_v.set_xlim(t_min, t_max)
+            except Exception:
+                pass
+            try:
+                if vs:
+                    vmin = min(vs)
+                    vmax = max(vs)
+                    if vmin == vmax:
+                        vmin -= 0.5
+                        vmax += 0.5
+                    self.plot_ax_v.set_ylim(vmin - 0.2, vmax + 0.2)
+            except Exception:
+                pass
+            try:
+                if is_:
+                    imin = min(is_)
+                    imax = max(is_)
+                    if imin == imax:
+                        # 若为常数线，先给出基本范围
+                        imin -= 0.1
+                        imax += 0.1
+                    rng = max(imax - imin, 0.2)
+                    # 增加底部留白，让曲线整体更靠下显示
+                    pad_bottom = max(0.1, 0.4 * rng)
+                    pad_top = max(0.05, 0.12 * rng)
+                    if self.plot_ax_i is not None:
+                        self.plot_ax_i.set_ylim(imin - pad_bottom, imax + pad_top)
+            except Exception:
+                pass
+
+            try:
+                self.plot_canvas.draw_idle()
+            except Exception:
+                pass
+            # 更新 PDO/RDO 纵向标记线
+            try:
+                # 基于开关决定是仅绘制窗口内事件，还是持久化历史事件
+                if not self.plot_times:
+                    return
+                t_max = max(self.plot_times)
+                t_min = t_max - float(self.plot_window_seconds)
+                with self._plot_lock:
+                    if self.keep_marker_history:
+                        evts = list(self.marker_events)
+                    else:
+                        evts = [ev for ev in self.marker_events if ev[0] >= t_min]
+
+                # 懒创建：仅为尚未创建 artist 的事件创建一次，避免重复
+                for x, kind in evts:
+                    key = (float(x), str(kind))
+                    if key in self._marker_artists_map:
+                        continue
+                    try:
+                        if kind == 'pdo':
+                            art = self.plot_ax_v.axvline(x=x, color="#093E72", linewidth=0.5, alpha=0.5, linestyle='-')
+                        else:
+                            art = self.plot_ax_v.axvline(x=x, color="#ff69b4", linewidth=0.5, alpha=0.5, linestyle='-')
+                        self._marker_artists_map[key] = art
+                    except Exception:
+                        pass
+                try:
+                    self.plot_canvas.draw_idle()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        finally:
+            # 继续定时刷新
+            try:
+                self._schedule_plot_update()
+            except Exception:
+                pass
+
     def set_status(self, text: str, level: str = 'info') -> None:
         """设置状态文本并根据级别调整状态栏颜色。
         level: info | ok | busy | warn | error
         """
         styles = {
-            'info':  {'bg': "#d4d4d4", 'fg': '#222222'},
-            'ok':    {'bg': "#bbe7c2", 'fg': '#107c10'},
-            'busy':  {'bg': "#b1cee9", 'fg': '#0b5cab'},
-            'warn':  {'bg': "#ece1b8", 'fg': '#9a6d00'},
-            'error': {'bg': "#f0a4aa", 'fg': '#a4262c'},
+            'info':  {'bg': "#d4d4d4", 'fg': "#353535"},
+            'ok':    {'bg': "#bbe7c2", 'fg': "#0a5c0a"},
+            'busy':  {'bg': "#b1cee9", 'fg': "#06315c"},
+            'warn':  {'bg': "#ece1b8", 'fg': "#745203"},
+            'error': {'bg': "#f0a4aa", 'fg': "#79161b"},
+            'egg':   {'bg': "#c698ec", 'fg': "#490696"},
         }
         style = styles.get(level, styles['info'])
         try:
@@ -479,23 +1384,22 @@ class WITRNGUI:
             if not pdo["Message Header"]["Extended"].value():
                 DO = pdo[3].value()
                 for i, obj in enumerate(DO):
-                    text += f" [{i+1}] {obj.quick_pdo()} |"
+                    if obj.quick_pdo() != "Not a PDO":
+                        text += f" [{i+1}] {obj.quick_pdo()} |"
             else:
                 DO = pdo[4].value()
-                if DO == None or DO == "Incomplete Data":
-                    pass
-                else:
+                if DO != None and DO != "Incomplete Data":
                     for i, obj in enumerate(DO):
-                        if obj.value() == "Empty PDO":
-                            continue
-                        else:
+                        if obj.quick_pdo() != "Not a PDO":
                             if i < 7:
                                 text += f" [{i+1}] {obj.quick_pdo()} |"
                             else:
                                 text += f" [{i+1}] E{obj.quick_pdo()} |"
         if rdo is not None:
             DO = rdo[3].value()
-            if DO[0]["Object Position"].value() < 8:
+            if DO == "Invalid Request Message":
+                text += "| Invalid RDO"
+            elif DO[0]["Object Position"].value() < 8:
                 text += f"| {DO[0].quick_rdo()}"
             else:
                 text += f"| {DO[0].quick_rdo()}"
@@ -529,213 +1433,482 @@ class WITRNGUI:
         self.set_status(f"已读取 {len(self.data_list)} 条数据", level='busy')
 
     def start_data_thread_if_needed(self):
-        """在设备可用时安全地启动数据采集线程一次。"""
-        if not self.device_open or not self.k2:
+        """在设备可用时安全地启动数据采集进程一次。"""
+        if not self.device_open or not self.parser:
             return
         if self.data_thread_started:
             return
 
-        # 启动收集线程
-        t = threading.Thread(target=self._collect_data_loop, daemon=True)
-        t.start()
-        self.data_thread_started = True
-
-    def _collect_data_loop(self):
-        """内部数据收集循环"""
-        while True:
+        # 启动多进程数据采集
+        try:
+            # 创建进程间通信组件
+            self.data_queue = Queue(maxsize=1000)  # PD数据队列
+            self.iv_queue = Queue(maxsize=500)     # 电参数据队列
+            self.stop_event = Event()
+            self.pause_flag = Value('i', 1)  # 初始为暂停状态
+            
+            # 启动数据采集进程
+            self.collection_process = Process(
+                target=data_collection_worker,
+                args=(self.data_queue, self.iv_queue, 
+                      self.stop_event, self.pause_flag),
+                daemon=True
+            )
+            self.collection_process.start()
+            
+            # 启动消费队列的线程（在主进程中）- 只启动一次
+            if self.queue_consumer_thread is None or not self.queue_consumer_thread.is_alive():
+                self.queue_consumer_running = True
+                self.queue_consumer_thread = threading.Thread(
+                    target=self._consume_queue_data,
+                    daemon=True
+                )
+                self.queue_consumer_thread.start()
+            
+            self.data_thread_started = True
+            
+        except Exception as e:
+            messagebox.showerror("启动失败", f"无法启动数据采集进程：{e}")
+            self.set_status("启动数据采集失败", level='error')
+    
+    def _consume_queue_data(self):
+        """消费队列中的数据（在主进程的后台线程中运行）"""
+        while self.queue_consumer_running:
             try:
-                if not self.device_open:
+                # 检查队列是否已被清理
+                if self.data_queue is None and self.iv_queue is None:
                     time.sleep(0.1)
                     continue
-                self.k2.read_data()
-                timestamp, pkg = self.k2.auto_unpack()
-                if pkg.field() == "pd":
-                    sop = pkg["SOP*"].value()
+                
+                # 处理PD数据队列
+                if self.data_queue is not None:
                     try:
-                        rev = pkg["Message Header"][4].value()[4:]
-                    except:
-                        rev = None
+                        while True:
+                            pd_data = self.data_queue.get_nowait()
+                            # 先检查错误信号，避免误报“设备已连接”
+                            if 'error' in pd_data:
+                                err = pd_data.get('error')
+                                if err == 'device_disconnected':
+                                    self.root.after(0, self._handle_device_disconnect)
+                                elif isinstance(err, str) and err.startswith('connection_failed'):
+                                    # 连接失败：回退UI并提示
+                                    self.root.after(0, lambda e=err: self._handle_connection_failed(e))
+                                # 无论何种错误，跳出本轮读取，避免死循环
+                                break
+                            # 非错误的第一条数据才确认连接成功
+                            if self.device_open and self.awaiting_connection_ack:
+                                try:
+                                    self.set_status("设备已连接", level='ok')
+                                except Exception:
+                                    pass
+                                self.awaiting_connection_ack = False
+                                # 若用户请求了“连接后自动开始”，此处自动开始收集
+                                try:
+                                    if self.autostart_after_connect:
+                                        self.is_paused = False
+                                        if self.pause_flag is not None:
+                                            self.pause_flag.value = 0
+                                        try:
+                                            self.pause_button.config(text="暂停")
+                                        except Exception:
+                                            pass
+                                        self.set_status("数据收集中...", level='busy')
+                                        self.autostart_after_connect = False
+                                except Exception:
+                                    pass
+                            
+                            # 添加数据项
+                            self.add_data_item(
+                                pd_data['sop'],
+                                pd_data['rev'],
+                                pd_data['ppr'],
+                                pd_data['pdr'],
+                                pd_data['msg_type'],
+                                pd_data['data'],
+                                pd_data['timestamp']
+                            )
+                            
+                            # 更新PDO/RDO
+                            if pd_data['is_pdo']:
+                                self.last_pdo = pd_data['last_pdo']
+                                try:
+                                    self._append_marker_event(pd_data['time_sec'], 'pdo')
+                                except:
+                                    pass
+                            
+                            if pd_data['is_rdo']:
+                                self.last_rdo = pd_data['last_rdo']
+                                try:
+                                    self._append_marker_event(pd_data['time_sec'], 'rdo')
+                                except:
+                                    pass
+                            
+                            self.set_quick_pdo_rdo(self.last_pdo, self.last_rdo)
+                            
+                    except queue.Empty:
+                        pass
+                    except Exception as e:
+                        if self.queue_consumer_running:  # 只在运行时报错
+                            print(f"处理PD数据时出错: {e}")
+                
+                # 处理电参数据队列
+                if self.iv_queue is not None:
                     try:
-                        ppr = pkg["Message Header"][3].value()
-                    except:
-                        ppr = None
-                    try:
-                        pdr = pkg["Message Header"][5].value()
-                    except:
-                        pdr = None
-                    try:
-                        msg_type = pkg["Message Header"]["Message Type"].value()
-                    except:
-                        msg_type = None
-                    data = pkg
-                    self.add_data_item(sop, rev, ppr, pdr, msg_type, data, timestamp)
-                    if is_pdo(pkg):
-                        self.last_pdo = pkg
-                        try:
-                            self._append_marker_event(time.time(), 'pdo')
-                        except Exception:
-                            pass
-                    if is_rdo(pkg):
-                        self.last_rdo = pkg
-                        try:
-                            self._append_marker_event(time.time(), 'rdo')
-                        except Exception:
-                            pass
-                    self.set_quick_pdo_rdo(self.last_pdo, self.last_rdo)
+                        while True:
+                            iv_data = self.iv_queue.get_nowait()
+                            # 首次收到数据，确认连接成功
+                            if self.device_open and self.awaiting_connection_ack:
+                                try:
+                                    self.set_status("设备已连接", level='ok')
+                                except Exception:
+                                    pass
+                                self.awaiting_connection_ack = False
+                                # 若用户请求了“连接后自动开始”，此处自动开始收集
+                                try:
+                                    if self.autostart_after_connect:
+                                        self.is_paused = False
+                                        if self.pause_flag is not None:
+                                            self.pause_flag.value = 0
+                                        try:
+                                            self.pause_button.config(text="暂停")
+                                        except Exception:
+                                            pass
+                                        self.set_status("数据收集中...", level='busy')
+                                        self.autostart_after_connect = False
+                                except Exception:
+                                    pass
+                            
+                            # plot数据点：无限制更新
+                            if iv_data.get('update_plot', False):
+                                try:
+                                    self._append_plot_point(
+                                        iv_data['timestamp'],
+                                        iv_data['voltage'],
+                                        iv_data['current']
+                                    )
+                                except:
+                                    pass
+                            
+                            # iv_info显示：限制在10Hz
+                            if iv_data.get('update_iv_info', False):
+                                if self.device_open:
+                                    self.set_iv_info(
+                                        f"{iv_data['current']:.3f}A",
+                                        f"{iv_data['voltage']:.3f}V",
+                                        f"{iv_data['power']:.3f}W",
+                                        f"{iv_data['cc1']:.1f}V",
+                                        f"{iv_data['cc2']:.1f}V",
+                                        f"{iv_data['dp']:.2f}V",
+                                        f"{iv_data['dn']:.2f}V"
+                                    )
+                            
+                    except queue.Empty:
+                        pass
+                    except Exception as e:
+                        if self.queue_consumer_running:  # 只在运行时报错
+                            print(f"处理电参数据时出错: {e}")
+                
+                # 短暂休眠避免空转
+                time.sleep(0.01)
+                
             except Exception as e:
-                # 仅当是真正的 read error 时才视为设备断开；其他错误可能不严重
-                err_text = str(e).lower()
-                if 'read error' in err_text:
-                    # 发生 read error，认为设备已断开或不可用
-                    print(f"数据采集异常（断开）: {e}")
-                    # 将设备句柄置空，停止当前数据收集状态
-                    try:
-                        self.is_paused = True
-                        self.device_open = False
-                        self.k2 = WITRN_DEV()
-                    except Exception:
-                        pass
+                if self.queue_consumer_running:  # 只在运行时报错
+                    print(f"消费队列数据时出错: {e}")
+                time.sleep(0.1)
+    
+    def _handle_device_disconnect(self):
+        """处理设备断开（在主线程中调用）"""
+        try:
+            self.is_paused = True
+            self.device_open = False
+            self.awaiting_connection_ack = False
+            self.autostart_after_connect = False
+            self.last_pdo = None
+            self.last_rdo = None
+            self.set_quick_pdo_rdo(None, None, force=True)
+            self.set_status("设备断开", level='error')
+            self.pause_button.config(text="开始", state=tk.DISABLED)
+            self.connect_button.config(text="连接设备", state=tk.NORMAL)
+            
+            # 重置基本信息面板
+            try:
+                self.reset_iv_info()
+            except:
+                pass
+            
+            # 停止曲线刷新
+            try:
+                self._stop_plot_updates()
+            except:
+                pass
+            
+            # 停止数据采集进程
+            self._stop_collection_process()
+            
+            # 弹窗提示
+            try:
+                messagebox.showwarning("设备断开", "检测到设备已断开，请重连或检查连接。")
+            except:
+                pass
+                
+        except Exception as e:
+            print(f"处理设备断开时出错: {e}")
 
-                    # 在线程安全地更新 UI：启用连接按钮，禁用开始/暂停按钮，更新状态
-                    def _on_disconnect():
-                        try:
-                            self.last_pdo = None
-                            self.last_rdo = None
-                            self.set_quick_pdo_rdo(None, None, force=True)
-                            self.set_status("设备断开", level='error')
-                            self.device_open = False
-                            self.pause_button.config(text="开始", state=tk.DISABLED)
-                            self.connect_button.config(text="连接设备", state=tk.NORMAL)
-                            # 弹窗提示用户设备断开
-                            try:
-                                messagebox.showwarning("设备断开", "检测到设备已断开，请重连或检查连接。")
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
+    def _handle_connection_failed(self, err_msg: str):
+        """处理连接失败：回退UI状态并清理资源。"""
+        try:
+            # 清理采集进程（若已启动会很快退出）
+            self._stop_collection_process()
+        except Exception:
+            pass
+        try:
+            self.device_open = False
+            self.is_paused = True
+            self.awaiting_connection_ack = False
+            self.autostart_after_connect = False
+            self.pause_button.config(text="开始", state=tk.DISABLED)
+            self.connect_button.config(text="连接设备", state=tk.NORMAL)
+            if hasattr(self, 'plot_toolbar') and self.plot_toolbar:
+                self.plot_toolbar.pack(side=tk.TOP, fill=tk.X)
+            # 停止曲线刷新，重置iv显示
+            try:
+                self._stop_plot_updates()
+            except Exception:
+                pass
+            try:
+                self.reset_iv_info()
+            except Exception:
+                pass
+            # 状态与提示
+            self.set_status("连接设备失败", level='error')
+            try:
+                messagebox.showerror("连接失败", f"无法连接到设备：{err_msg}")
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"处理连接失败时出错: {e}")
 
-                    try:
-                        self.root.after(0, _on_disconnect)
-                    except Exception:
-                        pass
-
-                    # 休眠后继续等待重连
-                    time.sleep(0.5)
-                else:
-                    # 非 read error：记录为警告并继续（不认为设备断开）
-                    print(f"数据采集警告（非断开）: {e}")
-                    try:
-                        # 在状态栏短暂显示警告信息（不打断用户）
-                        self.root.after(0, lambda: self.set_status(f"数据采集错误（可忽略）: {e}", level='warn'))
-                    except Exception:
-                        pass
-                    # 短暂停顿后继续循环，避免高速打印
-                    time.sleep(0.1)
+    def _stop_collection_process(self):
+        """停止数据采集进程"""
+        try:
+            # 先停止采集进程
+            if self.stop_event is not None:
+                self.stop_event.set()
+            
+            if self.collection_process is not None and self.collection_process.is_alive():
+                self.collection_process.join(timeout=2.0)
+                if self.collection_process.is_alive():
+                    self.collection_process.terminate()
+                self.collection_process = None
+            
+            # 标记数据采集线程已停止（但保持消费线程运行）
+            self.data_thread_started = False
+            
+            # 清理队列（在清理前等待一小段时间让消费线程处理完剩余数据）
+            time.sleep(0.05)
+            
+            if self.data_queue is not None:
+                try:
+                    while not self.data_queue.empty():
+                        self.data_queue.get_nowait()
+                except:
+                    pass
+                # 不要立即设为None，让消费线程能检测到空队列
+                # self.data_queue = None  # 移除这行
+            
+            if self.iv_queue is not None:
+                try:
+                    while not self.iv_queue.empty():
+                        self.iv_queue.get_nowait()
+                except:
+                    pass
+                # 不要立即设为None，让消费线程能检测到空队列
+                # self.iv_queue = None  # 移除这行
+            
+            self.stop_event = None
+            self.pause_flag = None
+            
+        except Exception as e:
+            print(f"停止采集进程时出错: {e}")
     
     def update_treeview(self):
-        """更新Treeview显示"""
-        # 保存当前选中的项目（按 Treeview item id），以及当前滚动位置和可见性/焦点状态。
+        """更新Treeview显示（优化版：支持增量更新）"""
+        current_data_count = len(self.data_list)
+        
+        # 获取当前的过滤条件和相对时间模式
+        hide_goodcrc = bool(getattr(self, 'filter_goodcrc_var', tk.BooleanVar()).get())
+        relative_mode = bool(getattr(self, 'relative_time_var', tk.BooleanVar()).get())
+        
+        # 判断是否需要完全重建（过滤条件变化、数据减少等情况）
+        need_full_rebuild = False
+        
+        # 检查是否是清空操作
+        if current_data_count == 0:
+            for child in self.tree.get_children():
+                self.tree.delete(child)
+            self.last_rendered_count = 0
+            self.last_relative_time_mode = relative_mode
+            self.last_filter_goodcrc_mode = hide_goodcrc
+            return
+        
+        # 检查模式是否发生变化（相对时间或过滤模式）
+        mode_changed = (relative_mode != self.last_relative_time_mode or 
+                       hide_goodcrc != self.last_filter_goodcrc_mode)
+        
+        # 检查是否需要完全重建（数据减少、过滤条件可能变化）
+        existing_count = len(self.tree.get_children())
+        if current_data_count < self.last_rendered_count or existing_count == 0 or mode_changed:
+            need_full_rebuild = True
+        
+        # 预计算相对时间的基准（第一条数据的时间）
+        base_seconds = None
+        if relative_mode and self.data_list:
+            base_seconds = self._parse_timestamp_to_seconds(self.data_list[0].timestamp)
+        
+        if need_full_rebuild:
+            # 完全重建模式（导入、清空、过滤等情况）
+            self._full_rebuild_treeview(hide_goodcrc, relative_mode, base_seconds)
+        else:
+            # 增量更新模式（正常采集数据）
+            self._incremental_update_treeview(hide_goodcrc, relative_mode, base_seconds)
+        
+        self.last_rendered_count = current_data_count
+        self.last_relative_time_mode = relative_mode
+        self.last_filter_goodcrc_mode = hide_goodcrc
+        
+        # 根据是否有数据启用/禁用导出按钮
+        try:
+            if self.data_list:
+                self.export_button.config(state=tk.NORMAL)
+            else:
+                self.export_button.config(state=tk.DISABLED)
+        except Exception:
+            pass
+    
+    def _full_rebuild_treeview(self, hide_goodcrc, relative_mode, base_seconds):
+        """完全重建Treeview（用于导入、清空等操作）"""
+        # 保存当前选中和滚动位置
         current_selection = self.tree.selection()
         selected_index = None
         selected_item_id = None
-        selected_was_visible = False
-        selected_was_focused = False
+        
         try:
             if current_selection:
                 selected_item_id = current_selection[0]
                 selected_item_vals = self.tree.item(selected_item_id)
                 try:
-                    selected_index = int(selected_item_vals['values'][0]) - 1  # 转换为0基索引
+                    selected_index = int(selected_item_vals['values'][0]) - 1
                 except Exception:
                     selected_index = None
-
-                # 如果选中项在更新前是可见的（bbox 返回非 None），记录下来
-                try:
-                    bbox = self.tree.bbox(selected_item_id)
-                    selected_was_visible = bbox is not None
-                except Exception:
-                    selected_was_visible = False
-
-                # 记录选中项是否拥有焦点
-                try:
-                    selected_was_focused = (self.tree.focus() == selected_item_id)
-                except Exception:
-                    selected_was_focused = False
         except Exception:
             selected_index = None
-
-        # 保存当前滚动位置（yview），以便在不希望强制滚动时恢复用户的视图。
+        
         try:
             prev_yview = self.tree.yview()
         except Exception:
             prev_yview = None
-
-        # 重新构建可见项目，考虑过滤选项
+        
+        # 清空现有项
         for child in self.tree.get_children():
             self.tree.delete(child)
-
-        hide_goodcrc = bool(getattr(self, 'filter_goodcrc_var', tk.BooleanVar()).get())
-        relative_mode = bool(getattr(self, 'relative_time_var', tk.BooleanVar()).get())
-
-        # 预计算相对时间的基准（第一条数据的时间）
-        base_seconds = None
-        if relative_mode and self.data_list:
-            base_seconds = self._parse_timestamp_to_seconds(self.data_list[0].timestamp)
-
+        
+        # 重新插入所有数据
         for item in self.data_list:
             if hide_goodcrc and isinstance(item.msg_type, str) and 'goodcrc' in item.msg_type.lower():
                 continue
-            # 计算用于 tag 的名称，优先使用 msg_type 的原始名称（如果在 MT 中注册过）
-            tag_name = None
-            try:
-                if isinstance(item.msg_type, str) and item.msg_type in MT:
-                    tag_name = item.msg_type
-                elif isinstance(item.msg_type, str):
-                    # 有时 msg_type 可能带有空格或大小写不同，尝试按不区分大小写匹配
-                    lowered = item.msg_type.lower()
-                    for k in MT.keys():
-                        if k.lower() == lowered:
-                            tag_name = k
-                            break
-                # 如果仍然没有匹配，但 msg_type 是字符串且 MT 中存在相同颜色值的安全标签，我们 won't create new colors here
-            except Exception:
-                tag_name = None
-
-            # 如果 tag_name 为 None，则不传递 tag（使用默认背景）
-            # 根据模式决定时间显示
-            display_time = item.timestamp
-            if relative_mode and base_seconds is not None:
-                cur_sec = self._parse_timestamp_to_seconds(item.timestamp)
-                if cur_sec is not None:
-                    dt = cur_sec - base_seconds
-                    if dt < 0:
-                        # 若出现负值（理论上不应发生），仍然规范化显示
-                        dt = 0.0
-                    display_time = self._format_relative_time(dt)
-
-            if tag_name:
+            
+            self._insert_tree_item(item, relative_mode, base_seconds)
+        
+        # 恢复选中状态和滚动位置
+        if selected_index is not None and 0 <= selected_index < len(self.data_list):
+            target_child = None
+            for child in self.tree.get_children():
+                item_values = self.tree.item(child)['values']
+                if item_values and int(item_values[0]) == selected_index + 1:
+                    target_child = child
+                    break
+            
+            if target_child is not None:
                 try:
-                    self.tree.insert('', tk.END, values=(
-                        item.index,
-                        display_time,
-                        item.sop,
-                        item.rev,
-                        item.ppr,
-                        item.pdr,
-                        item.msg_type
-                    ), tags=(tag_name,))
+                    self.tree.selection_set(target_child)
+                    self.tree.focus(target_child)
                 except Exception:
-                    # 如果插入时 tag 出错，退回到无 tag 插入
-                    self.tree.insert('', tk.END, values=(
-                        item.index,
-                        display_time,
-                        item.sop,
-                        item.rev,
-                        item.ppr,
-                        item.pdr,
-                        item.msg_type
-                    ))
-            else:
+                    pass
+        
+        # 恢复滚动位置
+        try:
+            if prev_yview and len(prev_yview) == 2:
+                self.tree.yview_moveto(prev_yview[0])
+        except Exception:
+            pass
+    
+    def _incremental_update_treeview(self, hide_goodcrc, relative_mode, base_seconds):
+        """增量更新Treeview（只添加新数据）"""
+        # 找出需要添加的新数据
+        existing_count = len(self.tree.get_children())
+        
+        # 计算应该有多少条数据（考虑过滤）
+        if hide_goodcrc:
+            # 需要计算已渲染的实际数据索引
+            # 这里简化处理：如果有过滤，使用完全重建
+            self._full_rebuild_treeview(hide_goodcrc, relative_mode, base_seconds)
+            return
+        
+        # 只添加新增的数据项
+        for i in range(existing_count, len(self.data_list)):
+            item = self.data_list[i]
+            self._insert_tree_item(item, relative_mode, base_seconds)
+        
+        # 自动滚动到底部（如果用户没有手动滚动）
+        try:
+            yview = self.tree.yview()
+            # 如果滚动条接近底部（>0.9），自动滚动到最新数据
+            if yview[1] > 0.9:
+                children = self.tree.get_children()
+                if children:
+                    self.tree.see(children[-1])
+        except Exception:
+            pass
+    
+    def _insert_tree_item(self, item, relative_mode, base_seconds):
+        """插入单个数据项到Treeview"""
+        # 计算tag
+        tag_name = None
+        try:
+            if isinstance(item.msg_type, str) and item.msg_type in MT:
+                tag_name = item.msg_type
+            elif isinstance(item.msg_type, str):
+                lowered = item.msg_type.lower()
+                for k in MT.keys():
+                    if k.lower() == lowered:
+                        tag_name = k
+                        break
+        except Exception:
+            tag_name = None
+        
+        # 计算显示时间
+        display_time = item.timestamp
+        if relative_mode and base_seconds is not None:
+            cur_sec = self._parse_timestamp_to_seconds(item.timestamp)
+            if cur_sec is not None:
+                dt = cur_sec - base_seconds
+                if dt < 0:
+                    dt = 0.0
+                display_time = self._format_relative_time(dt)
+        
+        # 插入数据
+        if tag_name:
+            try:
+                self.tree.insert('', tk.END, values=(
+                    item.index,
+                    display_time,
+                    item.sop,
+                    item.rev,
+                    item.ppr,
+                    item.pdr,
+                    item.msg_type
+                ), tags=(tag_name,))
+            except Exception:
                 self.tree.insert('', tk.END, values=(
                     item.index,
                     display_time,
@@ -745,51 +1918,16 @@ class WITRNGUI:
                     item.pdr,
                     item.msg_type
                 ))
-
-        # 恢复选中状态（如果选中的项仍然可见）。
-        # 重要：不要在每次刷新时强制滚动到选中项，以免打断用户的手动滚动。
-        if selected_index is not None and 0 <= selected_index < len(self.data_list):
-            target_child = None
-            for child in self.tree.get_children():
-                item_values = self.tree.item(child)['values']
-                if item_values and int(item_values[0]) == selected_index + 1:
-                    target_child = child
-                    break
-
-            if target_child is not None:
-                try:
-                    # 恢复 selection（高亮），但不要强制滚动到该项。
-                    # 将 selection_set 放在前面以保持高亮，但随后我们将恢复 yview，
-                    # 以确保用户的可视窗口不会被刷新打断。
-                    self.tree.selection_set(target_child)
-                    if selected_was_focused:
-                        try:
-                            self.tree.focus(target_child)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-            # 无论选中项是否在可见区域，都尝试恢复先前的滚动位置，优先保持用户视图不变。
-            try:
-                if prev_yview and len(prev_yview) == 2:
-                    self.tree.yview_moveto(prev_yview[0])
-            except Exception:
-                pass
-            else:
-                # 如果找不到对应项，恢复原来的 yview（如果可用），以保持用户视图
-                try:
-                    if prev_yview and len(prev_yview) == 2:
-                        self.tree.yview_moveto(prev_yview[0])
-                except Exception:
-                    pass
-        # 根据是否有数据启用/禁用导出按钮
-        try:
-            if self.data_list:
-                self.export_button.config(state=tk.NORMAL)
-            else:
-                self.export_button.config(state=tk.DISABLED)
-        except Exception:
-            pass
+        else:
+            self.tree.insert('', tk.END, values=(
+                item.index,
+                display_time,
+                item.sop,
+                item.rev,
+                item.ppr,
+                item.pdr,
+                item.msg_type
+            ))
 
     def _parse_timestamp_to_seconds(self, ts: Optional[str]) -> Optional[float]:
         """将 'HH:MM:SS.mmm' 或 'H:M:S.mmm' 样式的字符串解析为当天秒数（浮点）。
@@ -1038,11 +2176,11 @@ class WITRNGUI:
 
                         # 解析
                         try:
-                            if self.k2 is None:
+                            if self.parser is None:
                                 # 若仍无k2，跳过解析
                                 failed += 1
                                 continue
-                            _, pkg = self.k2.auto_unpack(data_bytes, last_pdo, last_ext, last_rdo)
+                            _, pkg = self.parser.auto_unpack(data_bytes, last_pdo, last_ext, last_rdo)
                             if is_pdo(pkg):
                                 last_pdo = pkg
                             if is_rdo(pkg):
@@ -1063,6 +2201,8 @@ class WITRNGUI:
                                     rev = None
                                 try:
                                     ppr = pkg["Message Header"][3].value()
+                                    if ppr == 'rved':
+                                        ppr = None
                                 except Exception:
                                     ppr = None
                                 try:
@@ -1103,37 +2243,77 @@ class WITRNGUI:
             messagebox.showerror("导入失败", f"无法导入CSV:\n{e}")
         
     def connect_device(self):
-        """连接WITRN设备"""
+        """连接/断开设备（连接/断开仅由采集进程处理，主进程不直接 open/close 设备）。"""
         try:
             if not self.device_open:
+                # 准备连接
                 if len(self.data_list) > 0:
                     if not messagebox.askyesno("确认", "连接设备将清空当前数据列表，是否继续？"):
                         return
                     self.clear_list(ask_user=False)
-                self.k2.open()
+                # 标记为“已连接（待开始）”，实际打开由采集进程完成
                 self.device_open = True
-                self.is_paused = True
+                self.is_paused = True  # 初始暂停，等待用户点击“开始”
+                self.set_status("正在连接设备...", level='warn')
+                self.awaiting_connection_ack = True
+                self.autostart_after_connect = False
+                # 启动采集进程（由其负责 open(device_path)）
                 self.start_data_thread_if_needed()
-                self.set_status("设备已连接", level='ok')
+                # 更新按钮与菜单
                 self.pause_button.config(state=tk.NORMAL, text="开始")
                 self.connect_button.config(text="断开连接")
+                # 连接后初始化并启动曲线刷新（仅当彩蛋激活后才有曲线区）
+                try:
+                    if self._egg_activated:
+                        self._ensure_plot_initialized()
+                        self._reset_plot()
+                        self._start_plot_updates()
+                except Exception:
+                    pass
             else:
-                self.k2.close()
+                # 断开连接：仅停止采集进程与本地状态，设备由子进程 close()
+                self._stop_collection_process()
                 self.last_pdo = None
                 self.last_rdo = None
                 self.set_quick_pdo_rdo(None, None, True)
                 self.device_open = False
                 self.is_paused = True
+                self.awaiting_connection_ack = False
+                self.autostart_after_connect = False
                 self.set_status("设备已断开", level='warn')
                 self.pause_button.config(state=tk.DISABLED, text="开始")
                 self.connect_button.config(text="连接设备")
+                # 重置基本信息面板（同步调用，保证立即刷新）
+                try:
+                    self.reset_iv_info()
+                except Exception:
+                    pass
+                # 断开后停止曲线刷新
+                try:
+                    self._stop_plot_updates()
+                except Exception:
+                    pass
+                time.sleep(0.1)
+                # 断开后无需重置解析器实例；设备连接实例在子进程中，会随子进程结束而释放。
         except Exception as e:
-            messagebox.showerror("连接失败", f"无法连接到设备：{e}")
+            try:
+                messagebox.showerror("连接失败", f"无法连接到设备：{e}")
+            except Exception:
+                pass
             self.set_status("连接设备失败", level='error')
     
     def pause_collection(self):
         """暂停/恢复数据收集"""
         if self.is_paused:
+            # 若仍在等待连接确认，则只标记连接后自动开始，避免错误显示“数据收集中...”
+            if self.awaiting_connection_ack:
+                self.autostart_after_connect = True
+                # 保持状态为“正在连接设备...”，按钮文案先行更新为“暂停”以告诉用户将自动开始
+                try:
+                    self.pause_button.config(text="暂停")
+                except Exception:
+                    pass
+                return
             # 恢复收集
             if self.import_mode:
                 if len(self.data_list) > 0:
@@ -1143,11 +2323,17 @@ class WITRNGUI:
                 # 退出导入模式
                 self.import_mode = False
             self.is_paused = False
+            # 通知采集进程恢复
+            if self.pause_flag is not None:
+                self.pause_flag.value = 0
             self.pause_button.config(text="暂停")
             self.set_status("数据收集中...", level='busy')
         else:
             # 暂停收集
             self.is_paused = True
+            # 通知采集进程暂停
+            if self.pause_flag is not None:
+                self.pause_flag.value = 1
             self.pause_button.config(text="开始")
             self.set_status("数据收集已暂停", level='warn')
 
@@ -1180,26 +2366,113 @@ class WITRNGUI:
                 self.set_status("列表已清空，数据收集中...", level='busy')
 
     def refresh_data_loop(self):
-        """数据刷新循环（在后台线程中运行）"""
+        """数据刷新循环（在后台线程中运行）
+        智能刷新机制：根据数据量动态调整刷新频率
+        """
         last_data_count = 0
         while True:
             try:
-                # 只有在数据发生变化时才更新显示
                 current_data_count = len(self.data_list)
+                
+                # 只有在数据发生变化时才考虑更新
                 if current_data_count != last_data_count:
-                    self.root.after(0, self.update_treeview)
-                    last_data_count = current_data_count
-                time.sleep(0.1)  # 100ms检查一次
+                    # 根据数据量计算刷新间隔（动态调整）
+                    if current_data_count < 1000:
+                        min_interval = 0.1    # <1k: 100ms (10Hz)
+                    elif current_data_count < 5000:
+                        min_interval = 0.3    # 1k-5k: 300ms (~3Hz)
+                    elif current_data_count < 10000:
+                        min_interval = 0.5    # 5k-10k: 500ms (2Hz)
+                    elif current_data_count < 20000:
+                        min_interval = 1.0    # 10k-20k: 1000ms (1Hz)
+                    else:
+                        min_interval = 2.0    # >20k: 2000ms (0.5Hz)
+                    
+                    now = time.time()
+                    time_since_last_update = now - self.last_treeview_update_time
+                    
+                    # 如果距离上次刷新已经超过最小间隔，立即刷新
+                    if time_since_last_update >= min_interval:
+                        self.root.after(0, self._safe_update_treeview)
+                        self.last_treeview_update_time = now
+                        last_data_count = current_data_count
+                    else:
+                        # 否则标记为待刷新，等待下次检查
+                        if not self.pending_treeview_update:
+                            self.pending_treeview_update = True
+                            # 计算还需要等待多久
+                            delay_ms = int((min_interval - time_since_last_update) * 1000)
+                            self.root.after(delay_ms, self._delayed_update_treeview)
+                
+                # 检查频率也根据数据量调整
+                if current_data_count < 5000:
+                    time.sleep(0.1)   # <5k: 快速检查
+                elif current_data_count < 20000:
+                    time.sleep(0.2)   # 5k-20k: 中速检查
+                else:
+                    time.sleep(0.5)   # >20k: 慢速检查
+                    
             except Exception as e:
                 print(f"刷新数据时出错: {e}")
                 time.sleep(1)
+    
+    def _safe_update_treeview(self):
+        """安全地更新Treeview（在主线程中调用）"""
+        try:
+            self.update_treeview()
+        except Exception as e:
+            print(f"更新Treeview时出错: {e}")
+    
+    def _delayed_update_treeview(self):
+        """延迟更新Treeview（用于批量更新）"""
+        try:
+            if self.pending_treeview_update:
+                self.pending_treeview_update = False
+                self.last_treeview_update_time = time.time()
+                self.update_treeview()
+        except Exception as e:
+            print(f"延迟更新Treeview时出错: {e}")
             
 
     def run(self):
         """运行GUI应用程序"""
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            # 程序退出时先停止消费线程
+            self.queue_consumer_running = False
+            
+            # 等待消费线程结束
+            if self.queue_consumer_thread is not None and self.queue_consumer_thread.is_alive():
+                self.queue_consumer_thread.join(timeout=1.0)
+            
+            # 再停止采集进程
+            self._stop_collection_process()
+            
+            # 最后清理队列
+            self.data_queue = None
+            self.iv_queue = None
     
 if __name__ == "__main__":
+    # Windows上必须设置为spawn模式以避免freeze_support问题
+    try:
+        multiprocessing.set_start_method('spawn')
+    except RuntimeError:
+        # 已经设置过了
+        pass
+    
     app = WITRNGUI()
     app.run()
-# python -m nuitka witrn_pd_sniffer.py --standalone --onefile --windows-console-mode=disable --enable-plugin=tk-inter --windows-icon-from-ico=brain.ico
+"""
+python -m nuitka witrn_pd_sniffer.py ^
+--standalone ^
+--onefile ^
+--windows-console-mode=disable ^
+--enable-plugin=tk-inter ^
+--windows-icon-from-ico=brain.ico ^
+--product-name="WITRN PD Sniffer" ^
+--product-version=3.4 ^
+--copyright="JohnScotttt" ^
+--output-dir=output ^
+--output-filename=witrn_pd_sniffer_v3.4.exe
+"""
