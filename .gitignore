@@ -1,3 +1,7 @@
 *.build
 *.dist
 *.onefile-build
+output/
+release/
+old/
+__pycache__/
