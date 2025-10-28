@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 import json
 from witrnhid import WITRN_DEV, metadata, is_pdo, is_rdo, provide_ext
-from icon import brain_ico
+from b64 import brain_ico
 
 
 MT = {

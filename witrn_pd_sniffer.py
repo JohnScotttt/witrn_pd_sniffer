@@ -16,7 +16,7 @@ import time
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from witrnhid import WITRN_DEV, metadata, is_pdo, is_rdo, provide_ext
-from icon import brain_ico
+from b64 import brain_ico, jb_r_tff, jb_b_tff
 from collections import deque
 import multiprocessing
 from multiprocessing import Process, Queue, Event, Value
@@ -252,6 +252,35 @@ def data_collection_worker(data_queue, iv_queue, stop_event, pause_flag):
             pass
 
 
+def renderer(msg: metadata, level: int, lst: list):
+    indent = '    ' * level
+    if not isinstance(msg.value(), list):
+        if msg.bit_loc()[0] == msg.bit_loc()[1]:
+            lst.append((f"{indent}{'[b'+str(msg.bit_loc()[0])+'] ':<12}", 'red'))
+        else:
+            lst.append((f"{indent}{'[b'+str(msg.bit_loc()[0])+'-b'+str(msg.bit_loc()[1])+'] ':<12}", 'red'))
+        lst.append((f"{msg.field()+': '}", ('black', 'bold')))
+        lst.append((f"{str(msg.value())} ", 'blue'))
+        if level < 2:
+            lst.append((f"(0x{int(msg.raw(), 2):0{int(len(msg.raw())/4)+(1 if len(msg.raw())%4 else 0)}X})\n", 'green'))
+        else:
+            lst.append((f"({msg.raw()}b)\n", 'green'))
+    else:
+        if msg.bit_loc()[0] == msg.bit_loc()[1]:
+            lst.append((f"{indent}{'[b'+str(msg.bit_loc()[0])+'] ':<12}", 'red'))
+        else:
+            lst.append((f"{indent}{'[b'+str(msg.bit_loc()[0])+'-b'+str(msg.bit_loc()[1])+'] ':<12}", 'red'))
+        lst.append((f"{msg.field()+': '}", ('black', 'bold')))
+        if msg.quick_pdo() != "Not a PDO":
+            lst.append((f"{msg.quick_pdo()} ", 'purple'))
+        if msg.quick_rdo() != "Not a RDO":
+            lst.append((f"{msg.quick_rdo()} ", 'purple'))
+        lst.append((f"(0x{int(msg.raw(), 2):0{int(len(msg.raw())/4)+(1 if len(msg.raw())%4 else 0)}X})\n", 'green'))
+        for submsg in msg.value():
+            renderer(submsg, level + 1, lst)
+    return lst
+
+
 class DataItem:
     """数据项类，表示列表中的一行数据"""
     def __init__(self, index: int, timestamp: str, sop: str, rev: str, ppr: str, pdr: str, msg_type: str, data: Any = None):
@@ -275,17 +304,41 @@ class WITRNGUI:
             self.root.withdraw()
         except Exception:
             pass
-        self.root.title("WITRN PD Sniffer v3.4 by JohnScotttt")
+        self.root.title("WITRN PD Sniffer v3.5 by JohnScotttt")
         # 使用内置的 base64 图标（brain_ico）设置窗口图标；失败则回退到本地 brain.ico
         try:
             ico_bytes = base64.b64decode(brain_ico)
-            tmp_path = os.path.join(tempfile.gettempdir(), "witrn_pd_sniffer_brain.ico")
-            with open(tmp_path, "wb") as f:
+            icon_tmp_path = os.path.join(tempfile.gettempdir(), "witrn_pd_sniffer_brain.ico")
+            with open(icon_tmp_path, "wb") as f:
                 f.write(ico_bytes)
-            self.root.iconbitmap(tmp_path)
+            self.root.iconbitmap(icon_tmp_path)
         except Exception:
             pass
-        # 锁定窗口大小，禁止用户调整（固定宽高）
+        # 导入字体
+        try:
+            jb_r_bytes = base64.b64decode(jb_r_tff)
+            jb_b_bytes = base64.b64decode(jb_b_tff)
+            font_tmp_path_r = os.path.join(tempfile.gettempdir(), "fonts/JetBrainsMono-Regular.ttf")
+            font_tmp_path_b = os.path.join(tempfile.gettempdir(), "fonts/JetBrainsMono-Bold.ttf")
+            os.makedirs(os.path.dirname(font_tmp_path_r), exist_ok=True)
+            with open(font_tmp_path_r, "wb") as f:
+                f.write(jb_r_bytes)
+            os.makedirs(os.path.dirname(font_tmp_path_b), exist_ok=True)
+            with open(font_tmp_path_b, "wb") as f:
+                f.write(jb_b_bytes)
+            FR_PRIVATE  = 0x10
+            FR_NOT_ENUM = 0x20
+            path_r = os.path.abspath(font_tmp_path_r)
+            path_b = os.path.abspath(font_tmp_path_b)
+
+            for font_path in [path_r, path_b]:
+                # 注册字体
+                res = ctypes.windll.gdi32.AddFontResourceExW(font_path, FR_PRIVATE, 0)
+                if res == 0:
+                    raise RuntimeError(f"无法加载字体文件: {font_path}")
+        except Exception:
+            pass
+
         self.root.resizable(False, False)
         try:
             w, h = 1600, 870
@@ -316,6 +369,9 @@ class WITRNGUI:
         except Exception:
             # 若任何一步失败，不阻塞主程序
             pass
+
+        # 数据文本显示区域
+        self.mono_en, self.mono_cn = ('JetBrains Mono', 'Consolas')
         
         # 数据存储
         self.data_list: List[DataItem] = []
@@ -333,9 +389,6 @@ class WITRNGUI:
         self.treeview_update_job = None        # 定时刷新任务ID
         self.last_relative_time_mode = False   # 跟踪上次的相对时间模式
         self.last_filter_goodcrc_mode = False  # 跟踪上次的过滤模式
-        
-        # 创建界面
-        self.create_widgets()
         
         # 启动数据刷新线程
         self.refresh_thread = threading.Thread(target=self.refresh_data_loop, daemon=True)
@@ -359,6 +412,9 @@ class WITRNGUI:
         self.pause_flag = None  # 共享值：0=收集中, 1=暂停
         self.queue_consumer_thread = None  # 消费队列数据的线程
         self.queue_consumer_running = False  # 消费线程运行标志
+
+        # 创建界面
+        self.create_widgets()
 
         # 彩蛋：全局键入“brain”触发
         self._egg_secret = "brain"
@@ -622,14 +678,13 @@ class WITRNGUI:
         right_frame.pack(side=tk.RIGHT, fill=tk.Y, expand=True, padx=(5, 0))
         # 保存引用，供彩蛋绘图在其下方插入曲线区
         self.right_frame = right_frame
-        
-        # 数据文本显示区域
+
         self.data_text = scrolledtext.ScrolledText(
-            right_frame, 
-            wrap=tk.WORD, 
-            width=50, 
+            right_frame,
+            wrap=tk.WORD,
+            width=50,
             height=25,
-            font=('Consolas', 10),
+            font=(self.mono_en, 9),
             state=tk.DISABLED  # 初始为只读
         )
         # 让文本区域位于上方，留出底部空间用于后续插入曲线
@@ -637,11 +692,15 @@ class WITRNGUI:
         # 注册颜色标签（Text widget 使用 tag 来控制文本样式）
         try:
             self.data_text.config(selectbackground="#b4d9fb", selectforeground="black")
-            # 这里用 tag_configure 注册需要的样式名
-            self.data_text.tag_configure('red', foreground='red')
-            self.data_text.tag_configure('blue', foreground='blue')
-            self.data_text.tag_configure('green', foreground='green')
-            self.data_text.tag_configure('bold', font=('Consolas', 10, 'bold'))
+            # 这里用 tag_configure 注册需要的样式名（动态字体名称）
+            self.data_text.tag_configure('red', foreground='red', font=(self.mono_en, 9))
+            self.data_text.tag_configure('blue', foreground='#476fD5', font=(self.mono_en, 9))
+            self.data_text.tag_configure('green', foreground='green', font=(self.mono_en, 9))
+            self.data_text.tag_configure('black', foreground='black', font=(self.mono_en, 9))
+            self.data_text.tag_configure('gray', foreground="#474747", font=(self.mono_en, 9))
+            self.data_text.tag_configure('purple', foreground='purple', font=(self.mono_en, 9))
+            self.data_text.tag_configure('cn', font=(self.mono_cn, 10))
+            self.data_text.tag_configure('bold', font=(self.mono_en, 9, 'bold'))
         except Exception:
             # 在极端环境下 tag_configure 可能失败，但不影响基本功能
             pass
@@ -2015,40 +2074,28 @@ class WITRNGUI:
             self.data_text.delete(1.0, tk.END)
 
             # 基本信息
-            info = (f"基本信息:\n序号: {item.index}\n时间: {item.timestamp}\nSOP: {item.sop}\n"
-                    f"PPR: {item.ppr}\nPDR: {item.pdr}\n消息类型: {item.msg_type}\n\n详细数据:\n")
-
-            self.data_text.insert(tk.END, info)
+            self.data_text.insert(tk.END, "==== 基本信息 ====\n", 'cn')
+            self.data_text.insert(tk.END, "Index: ", ('black', 'bold'))
+            self.data_text.insert(tk.END, f"{item.index}\n", 'gray')
+            self.data_text.insert(tk.END, "Time: ", ('black', 'bold'))
+            self.data_text.insert(tk.END, f"{item.timestamp}\n", 'gray')
+            self.data_text.insert(tk.END, "SOP: ", ('black', 'bold'))
+            self.data_text.insert(tk.END, f"{item.sop}\n", 'gray')
+            self.data_text.insert(tk.END, "Rev: ", ('black', 'bold'))
+            self.data_text.insert(tk.END, f"{item.rev}\n", 'gray')
+            self.data_text.insert(tk.END, "PPR: ", ('black', 'bold'))
+            self.data_text.insert(tk.END, f"{item.ppr}\n", 'gray')
+            self.data_text.insert(tk.END, "PDR: ", ('black', 'bold'))
+            self.data_text.insert(tk.END, f"{item.pdr}\n", 'gray')
+            self.data_text.insert(tk.END, "Message Type: ", ('black', 'bold'))
+            self.data_text.insert(tk.END, f"{item.msg_type}\n", 'gray')
+            self.data_text.insert(tk.END, "\n==== 详细数据 ====\n", 'cn')
             self.data_text.insert(tk.END, f"Raw: 0x{int(item.data.raw(), 2):0{int(len(item.data.raw())/4)+(1 if len(item.data.raw())%4!=0 else 0)}X}\n", 'green')
-            for value1 in item.data.value():
-                if not isinstance(value1.value(), list):
-                    self.data_text.insert(tk.END, f"{value1.field()+':':<35}")
-                    self.data_text.insert(tk.END, f"(Raw: 0x{int(value1.raw(), 2):0{int(len(value1.raw())/4)+(1 if len(value1.raw())%4!=0 else 0)}X})\n", 'green')
-                    self.data_text.insert(tk.END, f"    {value1.value()}\n")
-                else:
-                    self.data_text.insert(tk.END, f"{value1.field()+':':<35}")
-                    self.data_text.insert(tk.END, f"(Raw: 0x{int(value1.raw(), 2):0{int(len(value1.raw())/4)+(1 if len(value1.raw())%4!=0 else 0)}X})\n", 'green')
-                    for value2 in value1.value():
-                        if not isinstance(value2.value(), list):
-                            self.data_text.insert(tk.END, f"    {value2.field()}: {value2.value()}\n")
-                        else:
-                            if is_pdo(item.data) and value2.field()[:3] == "PDO":
-                                self.data_text.insert(tk.END, f"    {value2.field()+': '+value2.quick_pdo():<35}")
-                            elif is_rdo(item.data) and value2.field()[:3] == "RDO":
-                                self.data_text.insert(tk.END, f"    {value2.field()+': '+value2.quick_rdo():<35}")
-                            elif is_rdo(item.data) and value2.field() == "Copy of PDO":
-                                self.data_text.insert(tk.END, f"    {value2.field()+': '+value2.quick_pdo():<35}")
-                            else:
-                                self.data_text.insert(tk.END, f"    {value2.field()+':':<35}")
-                            self.data_text.insert(tk.END, f"(Raw: 0x{int(value2.raw(), 2):08X})\n", 'green')
-                            for value3 in value2.value():
-                                if not isinstance(value3.value(), list):
-                                    self.data_text.insert(tk.END, f"        {value3.field()}: {value3.value()}\n")
-                                else:
-                                    self.data_text.insert(tk.END, f"        {value3.field()}:\n")
-                                    for value4 in value3.value():
-                                        self.data_text.insert(tk.END, f"            {value4.field()}: {value4.value()}\n")
-
+            lst = []
+            for i in item.data.value():
+                renderer(i, 0, lst)
+            for line in lst:
+                self.data_text.insert(tk.END, line[0], line[1])
         finally:
             # 设回只读，防止用户编辑
             self.data_text.config(state=tk.DISABLED)
@@ -2471,8 +2518,8 @@ python -m nuitka witrn_pd_sniffer.py ^
 --enable-plugin=tk-inter ^
 --windows-icon-from-ico=brain.ico ^
 --product-name="WITRN PD Sniffer" ^
---product-version=3.4 ^
+--product-version=3.5.0.4 ^
 --copyright="JohnScotttt" ^
 --output-dir=output ^
---output-filename=witrn_pd_sniffer_v3.4.exe
+--output-filename=witrn_pd_sniffer_v3.5.exe
 """
