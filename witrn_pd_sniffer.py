@@ -261,7 +261,7 @@ def renderer(msg: metadata, level: int, lst: list):
             lst.append((f"{indent}{'[b'+str(msg.bit_loc()[0])+'-b'+str(msg.bit_loc()[1])+'] ':<12}", 'red'))
         lst.append((f"{msg.field()+': '}", ('black', 'bold')))
         lst.append((f"{str(msg.value())} ", 'blue'))
-        if level < 2:
+        if level < 1:
             lst.append((f"(0x{int(msg.raw(), 2):0{int(len(msg.raw())/4)+(1 if len(msg.raw())%4 else 0)}X})\n", 'green'))
         else:
             lst.append((f"({msg.raw()}b)\n", 'green'))
@@ -304,7 +304,7 @@ class WITRNGUI:
             self.root.withdraw()
         except Exception:
             pass
-        self.root.title("WITRN PD Sniffer v3.5 by JohnScotttt")
+        self.root.title("WITRN PD Sniffer v3.5.1 by JohnScotttt")
         # 使用内置的 base64 图标（brain_ico）设置窗口图标；失败则回退到本地 brain.ico
         try:
             ico_bytes = base64.b64decode(brain_ico)
@@ -2518,8 +2518,8 @@ python -m nuitka witrn_pd_sniffer.py ^
 --enable-plugin=tk-inter ^
 --windows-icon-from-ico=brain.ico ^
 --product-name="WITRN PD Sniffer" ^
---product-version=3.5.0.4 ^
+--product-version=3.5.1.0 ^
 --copyright="JohnScotttt" ^
 --output-dir=output ^
---output-filename=witrn_pd_sniffer_v3.5.exe
+--output-filename=witrn_pd_sniffer_v3.5.1.exe
 """
