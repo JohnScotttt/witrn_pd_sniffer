@@ -182,12 +182,12 @@ def data_collection_worker(data_queue, iv_queue, stop_event, pause_flag):
                     sop = pkg["SOP*"].value()
                     try:
                         rev = pkg["Message Header"][4].value()[4:]
+                        if rev == 'rved':
+                            rev = None
                     except:
                         rev = None
                     try:
                         ppr = pkg["Message Header"][3].value()
-                        if ppr == 'rved':
-                            ppr = None
                     except:
                         ppr = None
                     try:
@@ -304,7 +304,7 @@ class WITRNGUI:
             self.root.withdraw()
         except Exception:
             pass
-        self.root.title("WITRN PD Sniffer v3.5.1 by JohnScotttt")
+        self.root.title("WITRN PD Sniffer v3.5.2 by JohnScotttt")
         # 使用内置的 base64 图标（brain_ico）设置窗口图标；失败则回退到本地 brain.ico
         try:
             ico_bytes = base64.b64decode(brain_ico)
@@ -2244,12 +2244,12 @@ class WITRNGUI:
                                 sop = pkg["SOP*"].value()
                                 try:
                                     rev = pkg["Message Header"][4].value()[4:]
+                                    if rev == 'rved':
+                                        rev = None
                                 except Exception:
                                     rev = None
                                 try:
                                     ppr = pkg["Message Header"][3].value()
-                                    if ppr == 'rved':
-                                        ppr = None
                                 except Exception:
                                     ppr = None
                                 try:
@@ -2518,8 +2518,8 @@ python -m nuitka witrn_pd_sniffer.py ^
 --enable-plugin=tk-inter ^
 --windows-icon-from-ico=brain.ico ^
 --product-name="WITRN PD Sniffer" ^
---product-version=3.5.1.0 ^
+--product-version=3.5.2.0 ^
 --copyright="JohnScotttt" ^
 --output-dir=output ^
---output-filename=witrn_pd_sniffer_v3.5.1.exe
+--output-filename=witrn_pd_sniffer_v3.5.2.exe
 """
