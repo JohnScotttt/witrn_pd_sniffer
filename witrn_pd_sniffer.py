@@ -304,7 +304,7 @@ class WITRNGUI:
             self.root.withdraw()
         except Exception:
             pass
-        self.root.title("WITRN PD Sniffer v3.5.2 by JohnScotttt")
+        self.root.title("WITRN PD Sniffer v3.6 by JohnScotttt")
         # 使用内置的 base64 图标（brain_ico）设置窗口图标；失败则回退到本地 brain.ico
         try:
             ico_bytes = base64.b64decode(brain_ico)
@@ -371,7 +371,30 @@ class WITRNGUI:
             pass
 
         # 数据文本显示区域
-        self.mono_en, self.mono_cn = ('JetBrains Mono', 'Consolas')
+        self.font_en = 'JetBrains Mono'
+        self.font_cn = 'Microsoft YaHei'
+        self.font_status = 'Microsoft YaHei'
+        self.size_en = 9
+        self.size_cn = 9
+        self.size_status = 9
+        try:
+            with open("fonts.toml", "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                for line in lines:
+                    if line.startswith("font_en"):
+                        self.font_en = line.split('=')[1].strip().strip('"').strip("'")
+                    elif line.startswith("font_cn"):
+                        self.font_cn = line.split('=')[1].strip().strip('"').strip("'")
+                    elif line.startswith("size_en"):
+                        self.size_en = int(line.split('=')[1].strip())
+                    elif line.startswith("size_cn"):
+                        self.size_cn = int(line.split('=')[1].strip())
+                    elif line.startswith("font_status"):
+                        self.font_status = line.split('=')[1].strip().strip('"').strip("'")
+                    elif line.startswith("size_status"):
+                        self.size_status = int(line.split('=')[1].strip())
+        except Exception:
+            pass
         
         # 数据存储
         self.data_list: List[DataItem] = []
@@ -427,13 +450,13 @@ class WITRNGUI:
         self.iv_labels = {}
         # 每个电参标签的固定字符宽度（可按需单独调整）
         self.iv_label_char_widths = {
-            'current': 12,
-            'voltage': 12,
-            'power': 12,
-            'cc1': 12,
-            'cc2': 12,
-            'dp': 12,
-            'dn': 12,
+            'current': 14,
+            'voltage': 14,
+            'power': 14,
+            'cc1': 14,
+            'cc2': 14,
+            'dp': 14,
+            'dn': 14,
         }
         # 电参信息缓存（在未激活彩蛋前可先写入）
         self._iv_info_cached = {
@@ -473,6 +496,17 @@ class WITRNGUI:
 
     def create_widgets(self):
         """创建界面组件"""
+        style = ttk.Style()
+        style.configure("Treeview", font=(self.font_en, self.size_en), rowheight=25)  # 表格文字字体
+        style.configure("Treeview.Heading", font=(self.font_en, self.size_en))  # 表头文字字体
+        style.map("Treeview", 
+                  background=[('selected', '#0078d4')],  # 选中行背景色
+                  foreground=[('selected', 'white')])    # 选中行文字颜色
+        style.configure("TButton", font=(self.font_cn, self.size_cn))  # 按钮字体
+        style.configure("TCheckbutton", font=(self.font_cn, self.size_cn))  # 复选框字体
+        style.configure("TLabelframe.Label", font=(self.font_cn, self.size_cn))  # LabelFrame标题字体
+        style.configure("TLabel", font=(self.font_status, self.size_status))  # 标签字体
+
         # 主框架
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -489,7 +523,6 @@ class WITRNGUI:
             pass
         # 固定宽度750：仅纵向扩展，不在水平方向拉伸
         left_frame.pack(side=tk.LEFT, fill=tk.Y, expand=True, padx=(0, 5))
-
 
         # 按钮与数据操作区（移动到左侧）
         button_frame = ttk.Frame(left_frame)
@@ -578,39 +611,15 @@ class WITRNGUI:
 
 
         # 创建Treeview（表格）
-        columns = ('序号', '时间', 'SOP', 'Rev', 'PPR', 'PDR', 'Msg Type')
+        columns = ('Index', 'Time', 'SOP', 'Rev', 'PPR', 'PDR', 'Msg Type')
         self.tree = ttk.Treeview(list_group, columns=columns, show='headings', height=20)
         
         # 设置列标题和宽度
-        column_widths = {'序号': 50, '时间': 110, 'SOP': 90, 'Rev': 50, 'PPR': 140, 'PDR': 60, 'Msg Type': 210}
+        column_widths = {'Index': 50, 'Time': 110, 'SOP': 90, 'Rev': 50, 'PPR': 140, 'PDR': 60, 'Msg Type': 210}
         for col in columns:
             self.tree.heading(col, text=col)
             # 禁止随容器自动伸缩，固定列宽
             self.tree.column(col, width=column_widths[col], anchor=tk.CENTER, stretch=False)
-        
-        # 配置选择样式，确保选中行高亮显示
-        style = ttk.Style()
-        style.configure("Treeview", rowheight=25)
-        
-        # 设置选中行的样式
-        try:
-            # 尝试使用蓝色高亮
-            style.map("Treeview", 
-                     background=[('selected', '#0078d4')],  # 选中行背景色
-                     foreground=[('selected', 'white')])    # 选中行文字颜色
-            print("使用自定义蓝色高亮样式")
-        except Exception as e:
-            print(f"自定义样式设置失败: {e}")
-            try:
-                # 尝试使用系统默认高亮
-                style.map("Treeview", 
-                         background=[('selected', '')],  # 使用系统默认选中背景色
-                         foreground=[('selected', '')])  # 使用系统默认选中文字颜色
-                print("使用系统默认高亮样式")
-            except Exception as e2:
-                print(f"系统默认样式也失败: {e2}")
-                # 如果都失败，至少设置基本样式
-                style.configure("Treeview", rowheight=25)
         
         # 添加滚动条
         tree_scrollbar = ttk.Scrollbar(list_group, orient=tk.VERTICAL, command=self.tree.yview)
@@ -684,8 +693,13 @@ class WITRNGUI:
             wrap=tk.WORD,
             width=50,
             height=25,
-            font=(self.mono_en, 9),
-            state=tk.DISABLED  # 初始为只读
+            font=(self.font_en, self.size_en),
+            state=tk.DISABLED,  # 初始为只读
+            bd=0,
+            relief='flat',
+            highlightthickness=1,
+            highlightbackground="#D9D9D9",  # 未聚焦时浅色线框
+            highlightcolor="#BFBFBF"        # 聚焦时更明显一点
         )
         # 让文本区域位于上方，留出底部空间用于后续插入曲线
         self.data_text.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -693,20 +707,20 @@ class WITRNGUI:
         try:
             self.data_text.config(selectbackground="#b4d9fb", selectforeground="black")
             # 这里用 tag_configure 注册需要的样式名（动态字体名称）
-            self.data_text.tag_configure('red', foreground='red', font=(self.mono_en, 9))
-            self.data_text.tag_configure('blue', foreground='#476fD5', font=(self.mono_en, 9))
-            self.data_text.tag_configure('green', foreground='green', font=(self.mono_en, 9))
-            self.data_text.tag_configure('black', foreground='black', font=(self.mono_en, 9))
-            self.data_text.tag_configure('gray', foreground="#474747", font=(self.mono_en, 9))
-            self.data_text.tag_configure('purple', foreground='purple', font=(self.mono_en, 9))
-            self.data_text.tag_configure('cn', font=(self.mono_cn, 10))
-            self.data_text.tag_configure('bold', font=(self.mono_en, 9, 'bold'))
+            self.data_text.tag_configure('red', foreground='red', font=(self.font_en, self.size_en))
+            self.data_text.tag_configure('blue', foreground='#476fD5', font=(self.font_en, self.size_en))
+            self.data_text.tag_configure('green', foreground='green', font=(self.font_en, self.size_en))
+            self.data_text.tag_configure('black', foreground='black', font=(self.font_en, self.size_en))
+            self.data_text.tag_configure('gray', foreground="#474747", font=(self.font_en, self.size_en))
+            self.data_text.tag_configure('purple', foreground='purple', font=(self.font_en, self.size_en))
+            self.data_text.tag_configure('cn', font=(self.font_cn, self.size_cn))
+            self.data_text.tag_configure('bold', font=(self.font_en, self.size_en, 'bold'))
         except Exception:
             # 在极端环境下 tag_configure 可能失败，但不影响基本功能
             pass
         
         # 底部全局状态栏容器（跨全宽）- 方便左右放置多个标签
-        self.status_bar = tk.Frame(self.root, bd=0, relief='flat', highlightthickness=0)
+        self.status_bar = tk.Frame(self.root, bd=0, relief='flat', highlightthickness=0, )
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
         # 左侧：常规状态文本
@@ -720,6 +734,7 @@ class WITRNGUI:
             highlightthickness=0,
             padx=8,
             pady=4,
+            font=(self.font_status, self.size_status)
         )
         # 左侧标签占据剩余空间
         self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -735,6 +750,7 @@ class WITRNGUI:
             highlightthickness=0,
             padx=8,
             pady=4,
+            font=(self.font_status, self.size_status)
         )
         self.quick_pd_label.pack(side=tk.RIGHT)
 
@@ -2518,8 +2534,8 @@ python -m nuitka witrn_pd_sniffer.py ^
 --enable-plugin=tk-inter ^
 --windows-icon-from-ico=brain.ico ^
 --product-name="WITRN PD Sniffer" ^
---product-version=3.5.2.0 ^
+--product-version=3.6.0 ^
 --copyright="JohnScotttt" ^
 --output-dir=output ^
---output-filename=witrn_pd_sniffer_v3.5.2.exe
+--output-filename=witrn_pd_sniffer_v3.6.exe
 """
