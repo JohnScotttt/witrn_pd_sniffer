@@ -1,3 +1,2 @@
 witrnhid
-pywebview
 matplotlib
