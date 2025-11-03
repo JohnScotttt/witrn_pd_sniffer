@@ -283,9 +283,11 @@ def renderer(msg: metadata, level: int, lst: list):
 
 class DataItem:
     """数据项类，表示列表中的一行数据"""
-    def __init__(self, index: int, timestamp: str, sop: str, rev: str, ppr: str, pdr: str, msg_type: str, data: Any = None):
+    def __init__(self, index: int, timestamp: str, sop: str, rev: str, ppr: str, pdr: str, msg_type: str, data: Any = None, time_sec: Optional[float] = None):
         self.index = index
         self.timestamp = timestamp
+        # 采集时的绝对时间戳（time.time()，单位：秒），用于与曲线相对时间对齐
+        self.time_sec: Optional[float] = time_sec
         self.sop = sop
         self.rev = rev
         self.ppr = ppr
@@ -304,7 +306,7 @@ class WITRNGUI:
             self.root.withdraw()
         except Exception:
             pass
-        self.root.title("WITRN PD Sniffer v3.6.1 by JohnScotttt")
+        self.root.title("WITRN PD Sniffer v3.7.0 by JohnScotttt")
         # 使用内置的 base64 图标（brain_ico）设置窗口图标；失败则回退到本地 brain.ico
         try:
             ico_bytes = base64.b64decode(brain_ico)
@@ -782,7 +784,21 @@ class WITRNGUI:
         self._marker_artists = []  # 兼容旧逻辑：绘制时生成的 vline 句柄
         # 新增：为事件建立 artist 映射，避免重复创建，并支持保留历史
         self._marker_artists_map = {}  # key: (x, kind) -> artist
-        self.keep_marker_history = True  # 为 True 时，PDO/RDO 标线在历史中保留
+        self.keep_marker_history = True  # 为 True 时,PDO/RDO 标线在历史中保留
+        # 选中项的固定竖线（列表选中或点击锁定时使用）
+        self._selected_vline_artist = None
+        self._selected_text_artist = None     # 固定线旁边的文本标签
+        # hover预览竖线（独立的一条，仅悬停时显示）
+        self._hover_vline_artist = None
+        self._hover_text_artist = None        # hover预览线旁边的文本标签
+        # 鼠标悬停相关状态
+        self._hover_update_job = None         # 悬停刷新任务ID
+        self._hover_last_x = None             # 上次悬停的x坐标
+        self._hover_last_item_index = None    # 上次悬停对应的item索引
+        self._is_mouse_in_plot = False        # 鼠标是否在plot内
+        self._last_click_time = 0.0           # 上次点击时间（用于区分点击与拖拽）
+        self._click_start_x = None            # 点击开始时的x坐标
+        self._is_vline_locked = False         # 固定竖线是否已锁定（点击后固定）
 
     def _on_global_keypress(self, event: tk.Event) -> None:
         """捕获全局键盘输入，用于检测彩蛋口令。"""
@@ -1074,12 +1090,12 @@ class WITRNGUI:
         if self.plot_ax_i is not None:
             self.plot_ax_i.set_ylabel("Current (A)", color="#d62728")
 
-        # 预置两条线对象
-        self._line_v, = self.plot_ax_v.plot([], [], color="#1f77b4", linewidth=1.5, label="VBus")
+        # 预置两条线对象（设置 zorder 确保在竖线上方）
+        self._line_v, = self.plot_ax_v.plot([], [], color="#1f77b4", linewidth=1.5, label="VBus", zorder=10)
         if self.plot_ax_i is not None:
-            self._line_i, = self.plot_ax_i.plot([], [], color="#d62728", linewidth=1.3, label="Current")
+            self._line_i, = self.plot_ax_i.plot([], [], color="#d62728", linewidth=1.3, label="Current", zorder=11)
         else:
-            self._line_i, = self.plot_ax_v.plot([], [], color="#d62728", linewidth=1.3, label="Current")
+            self._line_i, = self.plot_ax_v.plot([], [], color="#d62728", linewidth=1.3, label="Current", zorder=11)
 
         try:
             self.plot_ax_v.grid(True, linestyle='--', alpha=0.3)
@@ -1127,6 +1143,9 @@ class WITRNGUI:
             else:
                 self.plot_toolbar.pack(side=tk.TOP, fill=tk.X)
             self.plot_canvas._tkcanvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+            
+            # 绑定鼠标事件（用于hover预览与点击锁定）
+            self._bind_plot_mouse_events()
         except Exception:
             # 若画布创建失败，给出提示
             try:
@@ -1264,6 +1283,50 @@ class WITRNGUI:
                 pass
             finally:
                 self._marker_artists_map = {}
+            # 移除当前选中竖线和文本标签并解锁
+            try:
+                if getattr(self, '_selected_vline_artist', None) is not None:
+                    try:
+                        self._selected_vline_artist.remove()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                self._selected_vline_artist = None
+            try:
+                if getattr(self, '_selected_text_artist', None) is not None:
+                    try:
+                        self._selected_text_artist.remove()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                self._selected_text_artist = None
+                self._is_vline_locked = False
+                self._hover_last_item_index = None
+            # 移除hover预览竖线和文本标签
+            try:
+                if getattr(self, '_hover_vline_artist', None) is not None:
+                    try:
+                        self._hover_vline_artist.remove()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                self._hover_vline_artist = None
+            try:
+                if getattr(self, '_hover_text_artist', None) is not None:
+                    try:
+                        self._hover_text_artist.remove()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                self._hover_text_artist = None
             # 坐标轴复位
             try:
                 if self.plot_ax_v is not None:
@@ -1311,6 +1374,508 @@ class WITRNGUI:
                 if self.plot_start_time is not None:
                     rel_time = float(t_sec) - self.plot_start_time
                     self.marker_events.append((rel_time, kind))
+        except Exception:
+            pass
+
+    def _get_item_plot_x(self, item: 'DataItem') -> Optional[float]:
+        """根据选中项计算其在曲线中的X坐标（相对时间）。
+        优先使用采集时的绝对时间戳time_sec与plot_start_time对齐；
+        如无time_sec，则尝试解析文本时间并与plot_start_time的当天秒数对齐，
+        处理跨天小概率场景（±12小时阈值修正）。
+        """
+        try:
+            if item is None or self.plot_start_time is None:
+                return None
+            # 首选：绝对时间
+            if getattr(item, 'time_sec', None) is not None:
+                return float(item.time_sec) - float(self.plot_start_time)
+
+            # 兜底：解析文本时间，按“当天秒”对齐
+            ts_sec = self._parse_timestamp_to_seconds(getattr(item, 'timestamp', None))
+            if ts_sec is None:
+                return None
+            lt = time.localtime(float(self.plot_start_time))
+            plot_day_sec = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec + (float(self.plot_start_time) % 1.0)
+            rel = ts_sec - plot_day_sec
+            # 简单跨天修正：若差异超过±12小时，则加/减24小时
+            if rel < -43200:
+                rel += 86400
+            elif rel > 43200:
+                rel -= 86400
+            return rel
+        except Exception:
+            return None
+
+    def _update_selection_vline(self, item: Optional['DataItem']) -> None:
+        """在曲线里绘制/更新当前选中的竖线：
+        - 颜色与左侧消息类型背景色一致
+        - 线宽为3
+        - 每次仅保留一条，切换选择时删除旧线
+        """
+        try:
+            # 若未初始化曲线或未启用彩蛋，则忽略
+            if not self._egg_activated or self.plot_ax_v is None or self.plot_canvas is None:
+                return
+            # 先移除旧的选中竖线
+            try:
+                if self._selected_vline_artist is not None:
+                    try:
+                        self._selected_vline_artist.remove()
+                    except Exception:
+                        pass
+            finally:
+                self._selected_vline_artist = None
+
+            if item is None:
+                # 仅移除
+                try:
+                    self.plot_canvas.draw_idle()
+                except Exception:
+                    pass
+                return
+
+            # 计算X坐标（相对时间）
+            x = self._get_item_plot_x(item)
+            if x is None:
+                return
+
+            # 计算颜色：与左侧列表相同的颜色（基于消息类型）
+            color_hex = None
+            try:
+                if isinstance(item.msg_type, str) and item.msg_type in MT:
+                    color_hex = MT[item.msg_type]
+                elif isinstance(item.msg_type, str):
+                    lowered = item.msg_type.lower()
+                    for k, v in MT.items():
+                        if k.lower() == lowered:
+                            color_hex = v
+                            break
+            except Exception:
+                color_hex = None
+            if not color_hex:
+                color_hex = '#000000'
+
+            # 绘制新的竖线（黑色细线，放在最底层）
+            try:
+                self._selected_vline_artist = self.plot_ax_v.axvline(
+                    x=x, color='#000000', linewidth=1, alpha=0.9, linestyle='-', zorder=0)
+            except Exception:
+                self._selected_vline_artist = None
+            
+            # 移除旧的文本标签
+            try:
+                if self._selected_text_artist is not None:
+                    try:
+                        self._selected_text_artist.remove()
+                    except Exception:
+                        pass
+            finally:
+                self._selected_text_artist = None
+            
+            # 在竖线旁边添加消息类型文本标签
+            try:
+                # 获取消息类型文本
+                msg_text = str(item.msg_type) if item.msg_type else "Unknown"
+                
+                # 获取当前Y轴范围，将文本放在顶部
+                try:
+                    ylim = self.plot_ax_v.get_ylim()
+                    y_pos = ylim[1] * 0.95  # 放在Y轴95%的位置
+                except Exception:
+                    y_pos = 20  # 默认位置
+                
+                # 绘制文本（带半透明白色背景框，显示在竖线右边）
+                self._selected_text_artist = self.plot_ax_v.text(
+                    x, y_pos, msg_text,
+                    rotation=90,  # 竖直显示
+                    verticalalignment='top',
+                    horizontalalignment='left',  # 文本左边对齐到x（竖直时，文本在竖线右边）
+                    fontsize=9,  # 固定线的文本稍大一点
+                    color="black",
+                    bbox=dict(
+                        boxstyle='round,pad=0.4',
+                        facecolor=color_hex,
+                        edgecolor=color_hex,
+                        alpha=0.7,  # 固定线的背景更不透明
+                        linewidth=1.5
+                    ),
+                    zorder=2  # 比hover预览线的文本更高一层
+                )
+            except Exception as e:
+                print(f"[DEBUG] 添加固定线文本标签失败: {e}")
+                self._selected_text_artist = None
+
+            try:
+                self.plot_canvas.draw_idle()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _update_hover_preview_vline(self, item: Optional['DataItem']) -> None:
+        """更新hover预览竖线（独立的一条，与固定竖线不同）。
+        - 颜色与报文类型一致
+        - 线宽为2（比固定竖线细一点）
+        - alpha=0.6（半透明，区别于固定竖线）
+        - 虚线样式（进一步区分）
+        """
+        try:
+            if not self._egg_activated or self.plot_ax_v is None or self.plot_canvas is None:
+                return
+            
+            # 先移除旧的hover预览线
+            try:
+                if self._hover_vline_artist is not None:
+                    try:
+                        self._hover_vline_artist.remove()
+                    except Exception:
+                        pass
+            finally:
+                self._hover_vline_artist = None
+            
+            # 移除旧的文本标签
+            try:
+                if self._hover_text_artist is not None:
+                    try:
+                        self._hover_text_artist.remove()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                self._hover_text_artist = None
+            
+            if item is None:
+                try:
+                    self.plot_canvas.draw_idle()
+                except Exception:
+                    pass
+                return
+            
+            # 计算X坐标
+            x = self._get_item_plot_x(item)
+            if x is None:
+                return
+            
+            # 计算颜色
+            color_hex = None
+            try:
+                if isinstance(item.msg_type, str) and item.msg_type in MT:
+                    color_hex = MT[item.msg_type]
+                elif isinstance(item.msg_type, str):
+                    lowered = item.msg_type.lower()
+                    for k, v in MT.items():
+                        if k.lower() == lowered:
+                            color_hex = v
+                            break
+            except Exception:
+                color_hex = None
+            if not color_hex:
+                color_hex = '#000000'
+            
+            # 绘制hover预览竖线（黑色细线、半透明、虚线，放在最底层）
+            try:
+                self._hover_vline_artist = self.plot_ax_v.axvline(
+                    x=x, color='#000000', linewidth=1, alpha=0.6, linestyle='--', zorder=0)
+            except Exception:
+                self._hover_vline_artist = None
+            
+            # 在竖线旁边添加消息类型文本标签
+            try:
+                # 获取消息类型文本
+                msg_text = str(item.msg_type) if item.msg_type else "Unknown"
+                
+                # 获取当前Y轴范围，将文本放在顶部
+                try:
+                    ylim = self.plot_ax_v.get_ylim()
+                    y_pos = ylim[1] * 0.95  # 放在Y轴95%的位置
+                except Exception:
+                    y_pos = 20  # 默认位置
+                
+                # 绘制文本（带半透明白色背景框，显示在竖线右边）
+                self._hover_text_artist = self.plot_ax_v.text(
+                    x, y_pos, msg_text,
+                    rotation=90,  # 竖直显示
+                    verticalalignment='top',
+                    horizontalalignment='left',  # 文本左边对齐到x（竖直时，文本在竖线右边）
+                    fontsize=8,
+                    color="black",
+                    bbox=dict(
+                        boxstyle='round,pad=0.3',
+                        facecolor=color_hex,
+                        edgecolor=color_hex,
+                        alpha=0.7,
+                        linewidth=1
+                    ),
+                    zorder=1  # 确保在最上层
+                )
+            except Exception as e:
+                print(f"[DEBUG] 添加文本标签失败: {e}")
+                self._hover_text_artist = None
+            
+            try:
+                self.plot_canvas.draw_idle()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _bind_plot_mouse_events(self) -> None:
+        """绑定plot的鼠标事件，用于hover预览和点击锁定。"""
+        try:
+            if self.plot_canvas is None:
+                print("[DEBUG] plot_canvas为None，无法绑定事件")
+                return
+            print("[DEBUG] 开始绑定plot鼠标事件")
+            # motion_notify_event: 鼠标移动
+            self.plot_canvas.mpl_connect('motion_notify_event', self._on_plot_mouse_move)
+            # button_press_event: 鼠标按下
+            self.plot_canvas.mpl_connect('button_press_event', self._on_plot_mouse_press)
+            # button_release_event: 鼠标释放
+            self.plot_canvas.mpl_connect('button_release_event', self._on_plot_mouse_release)
+            # axes_enter_event/axes_leave_event: 进入/离开坐标轴区域
+            self.plot_canvas.mpl_connect('axes_enter_event', self._on_plot_mouse_enter)
+            self.plot_canvas.mpl_connect('axes_leave_event', self._on_plot_mouse_leave)
+            print("[DEBUG] plot鼠标事件绑定完成")
+        except Exception as e:
+            print(f"[DEBUG] 绑定事件异常: {e}")
+            import traceback
+            traceback.print_exc()
+            pass
+
+    def _on_plot_mouse_enter(self, event) -> None:
+        """鼠标进入plot区域，启动hover刷新。"""
+        try:
+            print(f"[DEBUG] 鼠标进入plot区域")
+            self._is_mouse_in_plot = True
+            # 启动5Hz刷新（200ms间隔）
+            if self._hover_update_job is None:
+                self._schedule_hover_update()
+                print(f"[DEBUG] 启动hover刷新")
+        except Exception as e:
+            print(f"[DEBUG] 进入事件异常: {e}")
+            pass
+
+    def _on_plot_mouse_leave(self, event) -> None:
+        """鼠标离开plot区域，停止hover刷新并清除预览线。"""
+        try:
+            print(f"[DEBUG] 鼠标离开plot区域，开始清理")
+            self._is_mouse_in_plot = False
+            # 停止hover刷新
+            if self._hover_update_job is not None:
+                try:
+                    self.root.after_cancel(self._hover_update_job)
+                except Exception:
+                    pass
+                self._hover_update_job = None
+            # 清除hover预览竖线和文本标签
+            self._update_hover_preview_vline(None)
+            # 清除hover状态
+            self._hover_last_x = None
+            self._hover_last_item_index = None
+            print(f"[DEBUG] hover预览清理完成")
+        except Exception as e:
+            print(f"[DEBUG] 离开事件异常: {e}")
+            pass
+
+    def _on_plot_mouse_move(self, event) -> None:
+        """鼠标移动事件，记录当前x坐标供hover更新使用。"""
+        try:
+            # 检查是否在任一坐标轴内（电压轴或电流轴都可以）
+            if event.inaxes in (self.plot_ax_v, self.plot_ax_i) and event.xdata is not None:
+                self._hover_last_x = float(event.xdata)
+                # print(f"[DEBUG] 鼠标x={self._hover_last_x:.2f}")
+        except Exception as e:
+            print(f"[DEBUG] 移动事件异常: {e}")
+            import traceback
+            traceback.print_exc()
+            pass
+
+    def _on_plot_mouse_press(self, event) -> None:
+        """鼠标按下，记录点击位置和时间。"""
+        try:
+            # 检查是否在任一坐标轴内
+            if event.inaxes in (self.plot_ax_v, self.plot_ax_i) and event.xdata is not None:
+                self._click_start_x = float(event.xdata)
+                self._last_click_time = time.time()
+                print(f"[DEBUG] 鼠标按下 x={self._click_start_x:.2f}")
+        except Exception:
+            pass
+
+    def _on_plot_mouse_release(self, event) -> None:
+        """鼠标释放，判断是点击还是拖拽：
+        - 点击：释放位置与按下位置接近（<0.05s窗口内移动<视窗宽度5%），则锁定当前hover的竖线并同步选中列表
+        - 拖拽：视为工具栏操作（pan/zoom），不触发锁定
+        """
+        try:
+            # 检查是否在任一坐标轴内
+            if event.inaxes not in (self.plot_ax_v, self.plot_ax_i) or event.xdata is None:
+                return
+            if self._click_start_x is None:
+                return
+            
+            # 检查工具栏是否处于激活状态（Pan或Zoom模式）
+            toolbar_mode = None
+            try:
+                if hasattr(self, 'plot_toolbar') and self.plot_toolbar is not None:
+                    toolbar_mode = getattr(self.plot_toolbar, 'mode', None)
+            except Exception:
+                pass
+            
+            # 如果工具栏处于Pan或Zoom模式，不触发点击锁定
+            if toolbar_mode in ('pan/zoom', 'zoom rect'):
+                print(f"[DEBUG] 工具栏模式激活: {toolbar_mode}，跳过点击锁定")
+                return
+            
+            # 计算点击持续时间和移动距离
+            click_duration = time.time() - self._last_click_time
+            x_release = float(event.xdata)
+            x_diff = abs(x_release - self._click_start_x)
+            
+            # 获取当前视窗宽度
+            try:
+                xlim = self.plot_ax_v.get_xlim()
+                x_range = abs(xlim[1] - xlim[0])
+            except Exception:
+                x_range = self.plot_window_seconds
+            
+            # 判断是否为点击（而非拖拽）：时间<0.5s且移动距离<视窗宽度的5%
+            is_click = (click_duration < 0.5) and (x_diff < x_range * 0.05)
+            
+            print(f"[DEBUG] 鼠标释放 x={x_release:.2f}, diff={x_diff:.3f}, duration={click_duration:.3f}s, is_click={is_click}, toolbar_mode={toolbar_mode}")
+            
+            if is_click and self._hover_last_item_index is not None:
+                # 锁定并绘制固定竖线
+                self._is_vline_locked = True
+                print(f"[DEBUG] 锁定竖线，选中列表项 {self._hover_last_item_index}")
+                
+                # 清除hover预览线
+                self._update_hover_preview_vline(None)
+                
+                # 获取对应的item并绘制固定竖线
+                if self._hover_last_item_index < len(self.data_list):
+                    locked_item = self.data_list[self._hover_last_item_index]
+                    self._update_selection_vline(locked_item)
+                
+                # 同步选中左侧列表中的对应项
+                self._select_tree_item_by_index(self._hover_last_item_index)
+                # 自动聚焦（当设备断开且开发者模式开启时）
+                try:
+                    if (not self.device_open) and getattr(self, '_egg_activated', False):
+                        if self._hover_last_item_index < len(self.data_list):
+                            item = self.data_list[self._hover_last_item_index]
+                            x = self._get_item_plot_x(item)
+                            if x is not None:
+                                self._focus_on_time_x(x, window_seconds=2.0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            self._click_start_x = None
+
+    def _schedule_hover_update(self) -> None:
+        """启动hover刷新定时任务（5Hz = 200ms）。"""
+        try:
+            if self._is_mouse_in_plot:
+                self._update_hover_vline()
+                self._hover_update_job = self.root.after(200, self._schedule_hover_update)
+        except Exception:
+            self._hover_update_job = None
+
+    def _update_hover_vline(self) -> None:
+        """根据当前鼠标x坐标，查找最接近的报文并更新hover预览竖线。
+        注意：即使固定竖线已锁定，hover预览线仍然会显示（两条独立的线）。
+        """
+        try:
+            # 检查工具栏是否处于激活状态，如果是则不更新hover
+            try:
+                if hasattr(self, 'plot_toolbar') and self.plot_toolbar is not None:
+                    toolbar_mode = getattr(self.plot_toolbar, 'mode', None)
+                    if toolbar_mode in ('pan/zoom', 'zoom rect'):
+                        # print(f"[DEBUG] 工具栏激活，跳过hover")
+                        return
+            except Exception:
+                pass
+            if self._hover_last_x is None:
+                # print(f"[DEBUG] 没有鼠标x坐标")
+                return
+            if not self.data_list:
+                # print(f"[DEBUG] 数据列表为空")
+                return
+            if self.plot_start_time is None:
+                # print(f"[DEBUG] plot_start_time未设置")
+                return
+            
+            # 查找时间最接近的报文
+            closest_item = None
+            closest_index = None
+            min_diff = float('inf')
+            
+            for idx, item in enumerate(self.data_list):
+                item_x = self._get_item_plot_x(item)
+                if item_x is not None:
+                    diff = abs(item_x - self._hover_last_x)
+                    if diff < min_diff:
+                        min_diff = diff
+                        closest_item = item
+                        closest_index = idx
+            
+            # 如果找到且与上次不同，更新hover预览竖线
+            if closest_item is not None and closest_index != self._hover_last_item_index:
+                print(f"[DEBUG] 找到最近报文 idx={closest_index}, msg={closest_item.msg_type}, diff={min_diff:.3f}s")
+                self._hover_last_item_index = closest_index
+                # 绘制hover预览竖线（独立的一条）
+                self._update_hover_preview_vline(closest_item)
+        except Exception as e:
+            print(f"[DEBUG] hover更新异常: {e}")
+            import traceback
+            traceback.print_exc()
+            pass
+
+    def _select_tree_item_by_index(self, index: int) -> None:
+        """根据data_list索引，在左侧treeview中选中对应项。"""
+        try:
+            if not (0 <= index < len(self.data_list)):
+                return
+            item = self.data_list[index]
+            # 在treeview中查找index+1匹配的行（第0列为序号）
+            for child in self.tree.get_children():
+                values = self.tree.item(child)['values']
+                if values and int(values[0]) == item.index:
+                    # 选中该行
+                    self.tree.selection_set(child)
+                    self.tree.focus(child)
+                    self.tree.see(child)
+                    # 更新当前选择和右侧显示
+                    self.current_selection = item
+                    self.display_data(item)
+                    break
+        except Exception:
+            pass
+
+    def _focus_on_time_x(self, x: float, window_seconds: float = 2.0) -> None:
+        """将曲线视窗聚焦到给定相对时间x附近，窗口宽度为window_seconds（默认2s）。
+        仅调整X轴范围，保持Y轴范围不变（避免标签跑到画面外）。
+        仅做一次性调整，不会持续强制（不修改任何自动刷新策略）。
+        """
+        try:
+            if self.plot_ax_v is None or self.plot_canvas is None:
+                return
+            half = max(0.1, float(window_seconds) / 2.0)
+            xmin = x - half
+            xmax = x + half
+            # 设置X轴范围
+            try:
+                self.plot_ax_v.set_xlim(xmin, xmax)
+            except Exception:
+                pass
+
+            # 刷新一次画布
+            try:
+                self.plot_canvas.draw_idle()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1390,16 +1955,16 @@ class WITRNGUI:
                     else:
                         evts = [ev for ev in self.marker_events if ev[0] >= t_min]
 
-                # 懒创建：仅为尚未创建 artist 的事件创建一次，避免重复
+                # 懒创建：仅为尚未创建 artist 的事件创建一次，避免重复（放在最底层）
                 for x, kind in evts:
                     key = (float(x), str(kind))
                     if key in self._marker_artists_map:
                         continue
                     try:
                         if kind == 'pdo':
-                            art = self.plot_ax_v.axvline(x=x, color="#093E72", linewidth=0.5, alpha=0.5, linestyle='-')
+                            art = self.plot_ax_v.axvline(x=x, color="#093E72", linewidth=1, alpha=0.5, linestyle='-', zorder=0)
                         else:
-                            art = self.plot_ax_v.axvline(x=x, color="#ff69b4", linewidth=0.5, alpha=0.5, linestyle='-')
+                            art = self.plot_ax_v.axvline(x=x, color="#ff69b4", linewidth=1, alpha=0.5, linestyle='-', zorder=0)
                         self._marker_artists_map[key] = art
                     except Exception:
                         pass
@@ -1467,16 +2032,11 @@ class WITRNGUI:
                 if DO != None and DO != "Incomplete Data":
                     for i, obj in enumerate(DO):
                         if obj.quick_pdo() != "Not a PDO":
-                            if i < 7:
-                                text += f" [{i+1}] {obj.quick_pdo()} |"
-                            else:
-                                text += f" [{i+1}] E{obj.quick_pdo()} |"
+                            text += f" [{i+1}] {obj.quick_pdo()} |"
         if rdo is not None:
             DO = rdo[3].value()
             if DO == "Invalid Request Message":
                 text += "| Invalid RDO"
-            elif DO[0]["Object Position"].value() < 8:
-                text += f"| {DO[0].quick_rdo()}"
             else:
                 text += f"| {DO[0].quick_rdo()}"
 
@@ -1493,6 +2053,7 @@ class WITRNGUI:
                       msg_type: str,
                       data: Any = None,
                       timestamp: Optional[str] = None,
+                      time_sec: Optional[float] = None,
                       force: bool = False):
         """添加新的数据项到列表"""
         # 只有在未暂停时才添加数据，除非强制添加
@@ -1502,7 +2063,7 @@ class WITRNGUI:
         timestamp = timestamp or datetime.now().strftime("%H:%M:%S.%f")[:-3]
         index = len(self.data_list) + 1
 
-        item = DataItem(index, timestamp, sop, rev, ppr, pdr, msg_type, data)
+        item = DataItem(index, timestamp, sop, rev, ppr, pdr, msg_type, data, time_sec=time_sec)
         self.data_list.append(item)
         
         # 更新状态
@@ -1601,7 +2162,8 @@ class WITRNGUI:
                                 pd_data['pdr'],
                                 pd_data['msg_type'],
                                 pd_data['data'],
-                                pd_data['timestamp']
+                                pd_data['timestamp'],
+                                time_sec=pd_data.get('time_sec')
                             )
                             
                             # 更新PDO/RDO
@@ -2057,6 +2619,11 @@ class WITRNGUI:
             if 0 <= index < len(self.data_list):
                 self.current_selection = self.data_list[index]
                 self.display_data(self.current_selection)
+                # 锁定竖线（列表选中视为明确操作）
+                self._is_vline_locked = True
+                self._hover_last_item_index = index
+                # 更新曲线中的选中竖线
+                self._update_selection_vline(self.current_selection)
     
     def on_item_click(self, event):
         """处理鼠标点击事件，确保选中行高亮显示"""
@@ -2082,6 +2649,17 @@ class WITRNGUI:
             # 调试信息
             print(f"选中项目: {item}, 值: {self.tree.item(item)['values']}")
             print(f"当前选择: {self.tree.selection()}")
+
+            # 当设备断开且开发者模式开启时：选中报文后自动将竖线置于焦点
+            try:
+                if (not self.device_open) and getattr(self, '_egg_activated', False):
+                    # 使用当前选择项计算x并聚焦到2秒窗口（仅点击时触发一次）
+                    if self.current_selection is not None:
+                        x = self._get_item_plot_x(self.current_selection)
+                        if x is not None:
+                            self._focus_on_time_x(x, window_seconds=4)
+            except Exception:
+                pass
 
     def display_data(self, item: DataItem):
         """在右侧显示选中的数据"""
@@ -2406,6 +2984,14 @@ class WITRNGUI:
         if (not ask_user) or messagebox.askyesno("确认", "确定要清空所有数据吗？"):
             self.data_list.clear()
             self.current_selection = None
+            # 解锁竖线并清除（固定线和预览线都清除）
+            try:
+                self._is_vline_locked = False
+                self._hover_last_item_index = None
+                self._update_selection_vline(None)
+                self._update_hover_preview_vline(None)
+            except Exception:
+                pass
             self.update_treeview()
             # 临时启用以清空显示区域，然后恢复为只读
             try:
@@ -2535,8 +3121,8 @@ python -m nuitka witrn_pd_sniffer.py ^
 --enable-plugin=tk-inter ^
 --windows-icon-from-ico=brain.ico ^
 --product-name="WITRN PD Sniffer" ^
---product-version=3.6.1.0 ^
+--product-version=3.7.0.0 ^
 --copyright="JohnScotttt" ^
 --output-dir=output ^
---output-filename=witrn_pd_sniffer_v3.6.1.exe
+--output-filename=witrn_pd_sniffer_v3.7.0.exe
 """
