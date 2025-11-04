@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from witrnhid import WITRN_DEV, metadata, is_pdo, is_rdo, provide_ext
 from b64 import brain_ico, jb_r_tff, jb_b_tff
+from vendor_ids_dict import VENDOR_IDS
 from collections import deque
 import multiprocessing
 from multiprocessing import Process, Queue, Event, Value
@@ -261,6 +262,8 @@ def renderer(msg: metadata, level: int, lst: list):
             lst.append((f"{indent}{'[b'+str(msg.bit_loc()[0])+'-b'+str(msg.bit_loc()[1])+'] ':<12}", 'red'))
         lst.append((f"{msg.field()+': '}", ('black', 'bold')))
         lst.append((f"{str(msg.value())} ", 'blue'))
+        if msg.field() in ["USB Vendor ID", "VID"]:
+            lst.append((f"[{VENDOR_IDS.get(str(msg.value()), 'Unknown Vendor')}] ", 'blue'))
         if level < 1:
             lst.append((f"(0x{int(msg.raw(), 2):0{int(len(msg.raw())/4)+(1 if len(msg.raw())%4 else 0)}X})\n", 'green'))
         else:
@@ -306,7 +309,7 @@ class WITRNGUI:
             self.root.withdraw()
         except Exception:
             pass
-        self.root.title("WITRN PD Sniffer v3.7.0 by JohnScotttt")
+        self.root.title("WITRN PD Sniffer v3.7.1 by JohnScotttt")
         # 使用内置的 base64 图标（brain_ico）设置窗口图标；失败则回退到本地 brain.ico
         try:
             ico_bytes = base64.b64decode(brain_ico)
@@ -1413,8 +1416,8 @@ class WITRNGUI:
         - 每次仅保留一条，切换选择时删除旧线
         """
         try:
-            # 若未初始化曲线或未启用彩蛋，则忽略
-            if not self._egg_activated or self.plot_ax_v is None or self.plot_canvas is None:
+            # 若未初始化曲线或未启用彩蛋，或处于导入模式，则忽略
+            if not self._egg_activated or self.plot_ax_v is None or self.plot_canvas is None or self.import_mode:
                 return
             # 先移除旧的选中竖线
             try:
@@ -1425,6 +1428,16 @@ class WITRNGUI:
                         pass
             finally:
                 self._selected_vline_artist = None
+
+            # 移除旧的文本标签
+            try:
+                if self._selected_text_artist is not None:
+                    try:
+                        self._selected_text_artist.remove()
+                    except Exception:
+                        pass
+            finally:
+                self._selected_text_artist = None
 
             if item is None:
                 # 仅移除
@@ -1461,16 +1474,6 @@ class WITRNGUI:
                     x=x, color='#000000', linewidth=1, alpha=0.9, linestyle='-', zorder=0)
             except Exception:
                 self._selected_vline_artist = None
-            
-            # 移除旧的文本标签
-            try:
-                if self._selected_text_artist is not None:
-                    try:
-                        self._selected_text_artist.remove()
-                    except Exception:
-                        pass
-            finally:
-                self._selected_text_artist = None
             
             # 在竖线旁边添加消息类型文本标签
             try:
@@ -1520,7 +1523,7 @@ class WITRNGUI:
         - 虚线样式（进一步区分）
         """
         try:
-            if not self._egg_activated or self.plot_ax_v is None or self.plot_canvas is None:
+            if not self._egg_activated or self.plot_ax_v is None or self.plot_canvas is None or self.import_mode:
                 return
             
             # 先移除旧的hover预览线
@@ -1708,6 +1711,9 @@ class WITRNGUI:
         - 拖拽：视为工具栏操作（pan/zoom），不触发锁定
         """
         try:
+            # 导入模式下不处理点击
+            if self.import_mode:
+                return
             # 检查是否在任一坐标轴内
             if event.inaxes not in (self.plot_ax_v, self.plot_ax_i) or event.xdata is None:
                 return
@@ -1759,9 +1765,9 @@ class WITRNGUI:
                 
                 # 同步选中左侧列表中的对应项
                 self._select_tree_item_by_index(self._hover_last_item_index)
-                # 自动聚焦（当设备断开且开发者模式开启时）
+                # 自动聚焦（当设备断开、非导入模式且开发者模式开启时）
                 try:
-                    if (not self.device_open) and getattr(self, '_egg_activated', False):
+                    if (not self.device_open) and (not self.import_mode) and getattr(self, '_egg_activated', False):
                         if self._hover_last_item_index < len(self.data_list):
                             item = self.data_list[self._hover_last_item_index]
                             x = self._get_item_plot_x(item)
@@ -1788,6 +1794,9 @@ class WITRNGUI:
         注意：即使固定竖线已锁定，hover预览线仍然会显示（两条独立的线）。
         """
         try:
+            # 导入模式下不更新hover
+            if self.import_mode:
+                return
             # 检查工具栏是否处于激活状态，如果是则不更新hover
             try:
                 if hasattr(self, 'plot_toolbar') and self.plot_toolbar is not None:
@@ -2650,9 +2659,9 @@ class WITRNGUI:
             print(f"选中项目: {item}, 值: {self.tree.item(item)['values']}")
             print(f"当前选择: {self.tree.selection()}")
 
-            # 当设备断开且开发者模式开启时：选中报文后自动将竖线置于焦点
+            # 当设备断开、非导入模式且开发者模式开启时：选中报文后自动将竖线置于焦点
             try:
-                if (not self.device_open) and getattr(self, '_egg_activated', False):
+                if (not self.device_open) and (not self.import_mode) and getattr(self, '_egg_activated', False):
                     # 使用当前选择项计算x并聚焦到2秒窗口（仅点击时触发一次）
                     if self.current_selection is not None:
                         x = self._get_item_plot_x(self.current_selection)
@@ -3121,8 +3130,8 @@ python -m nuitka witrn_pd_sniffer.py ^
 --enable-plugin=tk-inter ^
 --windows-icon-from-ico=brain.ico ^
 --product-name="WITRN PD Sniffer" ^
---product-version=3.7.0.0 ^
+--product-version=3.7.1.0 ^
 --copyright="JohnScotttt" ^
 --output-dir=output ^
---output-filename=witrn_pd_sniffer_v3.7.0.exe
+--output-filename=witrn_pd_sniffer_v3.7.1.exe
 """
