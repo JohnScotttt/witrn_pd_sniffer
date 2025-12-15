@@ -309,7 +309,7 @@ class WITRNGUI:
             self.root.withdraw()
         except Exception:
             pass
-        self.root.title("WITRN PD Sniffer v3.7.1 by JohnScotttt")
+        self.root.title("WITRN PD Sniffer v3.7.2 by JohnScotttt")
         # 使用内置的 base64 图标（brain_ico）设置窗口图标；失败则回退到本地 brain.ico
         try:
             ico_bytes = base64.b64decode(brain_ico)
@@ -3130,8 +3130,8 @@ python -m nuitka witrn_pd_sniffer.py ^
 --enable-plugin=tk-inter ^
 --windows-icon-from-ico=brain.ico ^
 --product-name="WITRN PD Sniffer" ^
---product-version=3.7.1.0 ^
+--product-version=3.7.2.0 ^
 --copyright="JohnScotttt" ^
 --output-dir=output ^
---output-filename=witrn_pd_sniffer_v3.7.1.exe
+--output-filename=witrn_pd_sniffer_v3.7.2.exe
 """
