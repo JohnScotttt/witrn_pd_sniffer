@@ -29,6 +29,13 @@ matplotlib.use('TkAgg')  # 必须在导入 pyplot 之前设置
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
 
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1) # Windows 8.1 及以上
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware() # 旧版 Windows 兼容
+    except Exception:
+        pass
 
 MT = {
     "GoodCRC": "#e4fdff",
@@ -304,12 +311,13 @@ class WITRNGUI:
     
     def __init__(self):
         self.root = tk.Tk()
+        self.ui_scale = self._detect_ui_scale()
         # 先隐藏主窗口，等布局和几何设置完成后再显示，避免启动时小窗闪烁
         try:
             self.root.withdraw()
         except Exception:
             pass
-        self.root.title("WITRN PD Sniffer v3.7.2 by JohnScotttt")
+        self.root.title("WITRN PD Sniffer v3.7.3 by JohnScotttt")
         # 使用内置的 base64 图标（brain_ico）设置窗口图标；失败则回退到本地 brain.ico
         try:
             ico_bytes = base64.b64decode(brain_ico)
@@ -346,9 +354,11 @@ class WITRNGUI:
 
         # self.root.resizable(False, False)
         try:
-            w, h = 1000, 500
+            base_w, base_h = 1000, 500
+            w = self._scale_size(base_w)
+            h = self._scale_size(base_h)
             self.root.geometry(f"{w}x{h}")
-            self.root.minsize(780, 450)
+            self.root.minsize(self._scale_size(780), self._scale_size(450))
             # self.root.maxsize(w, h)
         except Exception:
             pass
@@ -503,7 +513,7 @@ class WITRNGUI:
     def create_widgets(self):
         """创建界面组件"""
         style = ttk.Style()
-        style.configure("Treeview", font=(self.font_en, self.size_en), rowheight=25)  # 表格文字字体
+        style.configure("Treeview", font=(self.font_en, self.size_en), rowheight=self._scale_size(25))  # 表格文字字体
         style.configure("Treeview.Heading", font=(self.font_en, self.size_en))  # 表头文字字体
         style.map("Treeview", 
                   background=[('selected', '#0078d4')],  # 选中行背景色
@@ -515,26 +525,29 @@ class WITRNGUI:
 
         # 主框架
         main_frame = ttk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=self._scale_size(10), pady=self._scale_size(10))
         
         # 左侧列表框架
         left_frame = ttk.Frame(main_frame)
         # 保存引用，供彩蛋在最上方插入控件
         self.left_frame = left_frame
         # 固定左侧宽度为750，并禁止根据子控件自动调整大小
-        left_frame.configure(width=750)
+        try:
+            left_frame.configure(width=self._scale_size(750))
+        except Exception:
+            pass
         try:
             left_frame.pack_propagate(False)
         except Exception:
             pass
         # 固定宽度750：仅纵向扩展，不在水平方向拉伸
-        left_frame.pack(side=tk.LEFT, fill=tk.Y, expand=True, padx=(0, 5))
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, expand=True, padx=(0, self._scale_size(5)))
 
         # 按钮与数据操作区（移动到左侧）
         button_frame = ttk.Frame(left_frame)
         # 保存引用，供彩蛋插入控件时控制相对位置
         self.button_frame = button_frame
-        button_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
+        button_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, self._scale_size(10)))
 
         # 屏蔽GoodCRC 复选框（与按钮同一层级，靠右）
         self.filter_goodcrc_var = tk.BooleanVar(value=False)
@@ -545,7 +558,7 @@ class WITRNGUI:
             command=self.update_treeview
         )
         # 先放置右侧控件，再放置左侧按钮，有利于布局
-        self.filter_goodcrc_cb.pack(side=tk.RIGHT, padx=(0, 5))
+        self.filter_goodcrc_cb.pack(side=tk.RIGHT, padx=(0, self._scale_size(5)))
 
         # 相对时间 复选框（放在“屏蔽GoodCRC”的左边）
         self.relative_time_var = tk.BooleanVar(value=False)
@@ -556,13 +569,13 @@ class WITRNGUI:
             command=self.update_treeview
         )
         # 也使用靠右布局，后放置因此位于“屏蔽GoodCRC”的左侧
-        self.relative_time_cb.pack(side=tk.RIGHT, padx=(0, 10))
+        self.relative_time_cb.pack(side=tk.RIGHT, padx=(0, self._scale_size(10)))
 
         # 状态栏将放到按钮区下方，见后文
 
         # 控制按钮框架
         control_frame = ttk.Frame(button_frame)
-        control_frame.pack(side=tk.LEFT, padx=(0, 20))
+        control_frame.pack(side=tk.LEFT, padx=(0, self._scale_size(20)))
 
         # 连接按钮
         self.connect_button = ttk.Button(
@@ -570,7 +583,7 @@ class WITRNGUI:
             text="连接设备", 
             command=self.connect_device
         )
-        self.connect_button.pack(side=tk.LEFT, padx=(0, 5))
+        self.connect_button.pack(side=tk.LEFT, padx=(0, self._scale_size(5)))
         
         # 暂停按钮
         self.pause_button = ttk.Button(
@@ -579,7 +592,7 @@ class WITRNGUI:
             command=self.pause_collection,
             state=tk.DISABLED
         )
-        self.pause_button.pack(side=tk.LEFT, padx=(0, 5))
+        self.pause_button.pack(side=tk.LEFT, padx=(0, self._scale_size(5)))
 
         # 数据操作按钮框架
         data_frame = ttk.Frame(button_frame)
@@ -593,7 +606,7 @@ class WITRNGUI:
             command=self.export_list,
             state=tk.DISABLED
         )
-        self.export_button.pack(side=tk.LEFT, padx=(0, 10))
+        self.export_button.pack(side=tk.LEFT, padx=(0, self._scale_size(10)))
 
         # 导入CSV按钮
         self.import_button = ttk.Button(
@@ -601,7 +614,7 @@ class WITRNGUI:
             text="导入CSV",
             command=self.import_csv
         )
-        self.import_button.pack(side=tk.LEFT, padx=(0, 10))
+        self.import_button.pack(side=tk.LEFT, padx=(0, self._scale_size(10)))
         
         # 清空按钮
         self.clear_button = ttk.Button(
@@ -612,7 +625,7 @@ class WITRNGUI:
         self.clear_button.pack(side=tk.LEFT)
 
         # 数据列表容器（用 LabelFrame 框住 Treeview），统一与右侧 padding 保持一致
-        list_group = ttk.LabelFrame(left_frame, text="数据列表", padding=10)
+        list_group = ttk.LabelFrame(left_frame, text="数据列表", padding=self._scale_size(10))
         list_group.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
 
@@ -624,8 +637,9 @@ class WITRNGUI:
         column_widths = {'Index': 50, 'Time': 110, 'SOP': 90, 'Rev': 50, 'PPR': 140, 'PDR': 60, 'Msg Type': 210}
         for col in columns:
             self.tree.heading(col, text=col)
+            scaled_width = self._scale_size(column_widths[col])
             # 禁止随容器自动伸缩，固定列宽
-            self.tree.column(col, width=column_widths[col], anchor=tk.CENTER, stretch=False)
+            self.tree.column(col, width=scaled_width, anchor=tk.CENTER, stretch=False)
         
         # 添加滚动条
         tree_scrollbar = ttk.Scrollbar(list_group, orient=tk.VERTICAL, command=self.tree.yview)
@@ -682,7 +696,7 @@ class WITRNGUI:
         self.tree.bind('<Button-1>', self.on_item_click, add='+')
         
         # 右侧数据显示框架
-        right_frame = ttk.LabelFrame(main_frame, text="数据显示", padding=10)
+        right_frame = ttk.LabelFrame(main_frame, text="数据显示", padding=self._scale_size(10))
         # 固定右侧宽度以配合左侧750和内边距（main_frame左右各10、左右分隔各5），此处取 820
         try:
             right_frame.configure(width=10000)
@@ -690,7 +704,7 @@ class WITRNGUI:
         except Exception:
             pass
         # 仅纵向扩展，宽度固定
-        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
+        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(self._scale_size(5), 0))
         # 保存引用，供彩蛋绘图在其下方插入曲线区
         self.right_frame = right_frame
 
@@ -738,8 +752,8 @@ class WITRNGUI:
             bd=0,
             relief='flat',
             highlightthickness=0,
-            padx=8,
-            pady=4,
+            padx=self._scale_size(8),
+            pady=self._scale_size(4),
             font=(self.font_status, self.size_status)
         )
         # 左侧标签占据剩余空间
@@ -754,8 +768,8 @@ class WITRNGUI:
             bd=0,
             relief='flat',
             highlightthickness=0,
-            padx=8,
-            pady=4,
+            padx=self._scale_size(8),
+            pady=self._scale_size(4),
             font=(self.font_status, self.size_status)
         )
         self.quick_pd_label.pack(side=tk.RIGHT)
@@ -888,9 +902,9 @@ class WITRNGUI:
                         self.iv_info_frame.destroy()
                 except Exception:
                     pass
-                self.iv_info_frame = ttk.LabelFrame(self.egg_top_row, text="基本信息", padding=8)
+                self.iv_info_frame = ttk.LabelFrame(self.egg_top_row, text="基本信息", padding=self._scale_size(8))
                 # 右侧面板占据剩余空间，并按Y方向填充与左侧保持同高
-                self.iv_info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 0))
+                self.iv_info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(self._scale_size(8), 0))
                 # 放置7个横向标签（电流、电压、功率、CC1、CC2、D+、D-）
                 try:
                     for child in getattr(self.iv_info_frame, 'winfo_children', lambda: [])():
@@ -915,7 +929,7 @@ class WITRNGUI:
                     text = f"{display_names[key]}: {self._iv_info_cached.get(key, '-')}"
                     width = int(self.iv_label_char_widths.get(key, 16))
                     lbl = ttk.Label(self.iv_info_frame, text=text, anchor='w', justify='left', width=width)
-                    lbl.pack(side=tk.LEFT, padx=(0, 2))
+                    lbl.pack(side=tk.LEFT, padx=(0, self._scale_size(2)))
                     self.iv_labels[key] = lbl
 
             # 4) 首次激活后，用缓存的电参信息刷新显示
@@ -981,6 +995,24 @@ class WITRNGUI:
             self.root.bind_all('<FocusIn>', _on_focus_in, add='+')
         except Exception:
             pass
+
+    def _detect_ui_scale(self) -> float:
+        """Return the OS-level Tk scaling factor (>=1.0 when unavailable)."""
+        try:
+            scale = float(self.root.tk.call('tk', 'scaling'))
+            if scale > 0:
+                return scale
+        except Exception:
+            pass
+        return 1.0
+
+    def _scale_size(self, value: float) -> int:
+        """Scale pixel-based dimensions by the current DPI factor."""
+        try:
+            scale = getattr(self, 'ui_scale', 1.0)
+            return max(1, int(round(float(value) * scale)))
+        except Exception:
+            return int(value)
 
     def _refresh_iv_label_async(self):
         """异步刷新右侧电参标签的内容，保证在主线程更新。"""
@@ -1066,15 +1098,15 @@ class WITRNGUI:
         plt.rcParams['agg.path.chunksize'] = 10000
         if getattr(self, 'right_frame', None) is None:
             return
-        self.plot_group = ttk.LabelFrame(self.right_frame, text="电流/电压 曲线", padding=6)
+        self.plot_group = ttk.LabelFrame(self.right_frame, text="电流/电压 曲线", padding=self._scale_size(6))
         # 放在底部，不参与 expand（保持固定高度）
         try:
-            self.plot_group.pack(side=tk.BOTTOM, fill=tk.X, expand=False, pady=(8, 0))
+            self.plot_group.pack(side=tk.BOTTOM, fill=tk.X, expand=False, pady=(self._scale_size(8), 0))
         except Exception:
-            self.plot_group.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+            self.plot_group.pack(side=tk.BOTTOM, fill=tk.X, pady=(self._scale_size(8), 0))
 
         # 承载画布的容器，固定高度，防止与上方文本竞争空间
-        self.plot_container = tk.Frame(self.plot_group, height=260)
+        self.plot_container = tk.Frame(self.plot_group, height=self._scale_size(260))
         try:
             self.plot_container.pack_propagate(False)
         except Exception:
@@ -3130,8 +3162,8 @@ python -m nuitka witrn_pd_sniffer.py ^
 --enable-plugin=tk-inter ^
 --windows-icon-from-ico=brain.ico ^
 --product-name="WITRN PD Sniffer" ^
---product-version=3.7.2.0 ^
+--product-version=3.7.3.0 ^
 --copyright="JohnScotttt" ^
 --output-dir=output ^
---output-filename=witrn_pd_sniffer_v3.7.2.exe
+--output-filename=witrn_pd_sniffer_v3.7.3.exe
 """
