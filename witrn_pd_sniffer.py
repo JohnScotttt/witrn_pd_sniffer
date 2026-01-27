@@ -6,6 +6,8 @@ WITRN HID PD查看器 GUI 应用程序
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
+import sqlite3
+import hid
 import os
 import base64
 import tempfile
@@ -13,9 +15,9 @@ import ctypes
 import csv
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
-from witrnhid import WITRN_DEV, metadata, is_pdo, is_rdo, provide_ext
+from witrnhid import WITRN_DEV, metadata, is_pdo, is_rdo, provide_ext, renderer
 from b64 import brain_ico, jb_r_tff, jb_b_tff
 from vendor_ids_dict import VENDOR_IDS
 from collections import deque
@@ -260,37 +262,6 @@ def data_collection_worker(data_queue, iv_queue, stop_event, pause_flag):
             pass
 
 
-def renderer(msg: metadata, level: int, lst: list):
-    indent = '    ' * level
-    if not isinstance(msg.value(), list):
-        if msg.bit_loc()[0] == msg.bit_loc()[1]:
-            lst.append((f"{indent}{'[b'+str(msg.bit_loc()[0])+'] ':<12}", 'red'))
-        else:
-            lst.append((f"{indent}{'[b'+str(msg.bit_loc()[0])+'-b'+str(msg.bit_loc()[1])+'] ':<12}", 'red'))
-        lst.append((f"{msg.field()+': '}", ('black', 'bold')))
-        lst.append((f"{str(msg.value())} ", 'blue'))
-        if msg.field() in ["USB Vendor ID", "VID"]:
-            lst.append((f"[{VENDOR_IDS.get(str(msg.value()), 'Unknown Vendor')}] ", 'blue'))
-        if level < 1:
-            lst.append((f"(0x{int(msg.raw(), 2):0{int(len(msg.raw())/4)+(1 if len(msg.raw())%4 else 0)}X})\n", 'green'))
-        else:
-            lst.append((f"({msg.raw()}b)\n", 'green'))
-    else:
-        if msg.bit_loc()[0] == msg.bit_loc()[1]:
-            lst.append((f"{indent}{'[b'+str(msg.bit_loc()[0])+'] ':<12}", 'red'))
-        else:
-            lst.append((f"{indent}{'[b'+str(msg.bit_loc()[0])+'-b'+str(msg.bit_loc()[1])+'] ':<12}", 'red'))
-        lst.append((f"{msg.field()+': '}", ('black', 'bold')))
-        if msg.quick_pdo() != "Not a PDO":
-            lst.append((f"{msg.quick_pdo()} ", 'purple'))
-        if msg.quick_rdo() != "Not a RDO":
-            lst.append((f"{msg.quick_rdo()} ", 'purple'))
-        lst.append((f"(0x{int(msg.raw(), 2):0{int(len(msg.raw())/4)+(1 if len(msg.raw())%4 else 0)}X})\n", 'green'))
-        for submsg in msg.value():
-            renderer(submsg, level + 1, lst)
-    return lst
-
-
 class DataItem:
     """数据项类，表示列表中的一行数据"""
     def __init__(self, index: int, timestamp: str, sop: str, rev: str, ppr: str, pdr: str, msg_type: str, data: Any = None, time_sec: Optional[float] = None):
@@ -311,13 +282,14 @@ class WITRNGUI:
     
     def __init__(self):
         self.root = tk.Tk()
-        self.ui_scale = self._detect_ui_scale()
+        self.ui_scale = 1.0
         # 先隐藏主窗口，等布局和几何设置完成后再显示，避免启动时小窗闪烁
         try:
             self.root.withdraw()
         except Exception:
             pass
-        self.root.title("WITRN PD Sniffer v3.7.3 by JohnScotttt")
+        self._init_ui_scale()
+        self.root.title("WITRN PD Sniffer v3.7.5 by JohnScotttt")
         # 使用内置的 base64 图标（brain_ico）设置窗口图标；失败则回退到本地 brain.ico
         try:
             ico_bytes = base64.b64decode(brain_ico)
@@ -354,11 +326,10 @@ class WITRNGUI:
 
         # self.root.resizable(False, False)
         try:
-            base_w, base_h = 1000, 500
-            w = self._scale_size(base_w)
-            h = self._scale_size(base_h)
+            w = self.scale_px(1000)
+            h = self.scale_px(500)
             self.root.geometry(f"{w}x{h}")
-            self.root.minsize(self._scale_size(780), self._scale_size(450))
+            self.root.minsize(self.scale_px(780), self.scale_px(450))
             # self.root.maxsize(w, h)
         except Exception:
             pass
@@ -372,9 +343,9 @@ class WITRNGUI:
 
             # 如果尺寸不合理（如 1），使用默认值
             if not target_w or target_w <= 1:
-                target_w = 1600
+                target_w = self.scale_px(1600)
             if not target_h or target_h <= 1:
-                target_h = 870
+                target_h = self.scale_px(870)
 
             screen_w = self.root.winfo_screenwidth()
             screen_h = self.root.winfo_screenheight()
@@ -510,10 +481,68 @@ class WITRNGUI:
         except Exception:
             pass
 
+    def _init_ui_scale(self) -> None:
+        """检测当前 DPI 缩放并记录到 ui_scale，供像素尺寸使用。"""
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
+        dpi = None
+        if os.name == 'nt':
+            hwnd = 0
+            try:
+                hwnd = int(self.root.winfo_id())
+            except Exception:
+                hwnd = 0
+            try:
+                if hwnd and hasattr(ctypes.windll.user32, "GetDpiForWindow"):
+                    dpi = ctypes.windll.user32.GetDpiForWindow(hwnd)
+                else:
+                    dpi = ctypes.windll.user32.GetDpiForSystem()
+            except Exception:
+                dpi = None
+
+        if dpi is None:
+            try:
+                dpi = float(self.root.winfo_fpixels('1i'))
+            except Exception:
+                dpi = 96.0
+
+        try:
+            scale = float(dpi) / 96.0 if dpi else 1.0
+        except Exception:
+            scale = 1.0
+
+        # 限制缩放范围，避免极端值导致的布局异常
+        self.ui_scale = max(0.5, min(scale, 4.0))
+
+    def scale_px(self, value, *, allow_float: bool = False):
+        """根据 DPI 缩放像素值，默认返回 int。"""
+        if value is None:
+            return None
+        try:
+            scaled = float(value) * float(getattr(self, 'ui_scale', 1.0))
+        except Exception:
+            return value
+
+        if allow_float:
+            return scaled
+
+        if abs(scaled) < 1e-3:
+            return 0
+        return int(round(scaled))
+
+    def scale_padding(self, value):
+        """缩放 pack/grid 中使用的 padding（可为数字或二元 tuple）。"""
+        if isinstance(value, tuple):
+            return tuple(self.scale_px(v) for v in value)
+        return self.scale_px(value)
+
     def create_widgets(self):
         """创建界面组件"""
         style = ttk.Style()
-        style.configure("Treeview", font=(self.font_en, self.size_en), rowheight=self._scale_size(25))  # 表格文字字体
+        style.configure("Treeview", font=(self.font_en, self.size_en), rowheight=self.scale_px(25))  # 表格文字字体
         style.configure("Treeview.Heading", font=(self.font_en, self.size_en))  # 表头文字字体
         style.map("Treeview", 
                   background=[('selected', '#0078d4')],  # 选中行背景色
@@ -525,29 +554,26 @@ class WITRNGUI:
 
         # 主框架
         main_frame = ttk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=self._scale_size(10), pady=self._scale_size(10))
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=self.scale_px(10), pady=self.scale_px(10))
         
         # 左侧列表框架
         left_frame = ttk.Frame(main_frame)
         # 保存引用，供彩蛋在最上方插入控件
         self.left_frame = left_frame
         # 固定左侧宽度为750，并禁止根据子控件自动调整大小
-        try:
-            left_frame.configure(width=self._scale_size(750))
-        except Exception:
-            pass
+        left_frame.configure(width=self.scale_px(750))
         try:
             left_frame.pack_propagate(False)
         except Exception:
             pass
         # 固定宽度750：仅纵向扩展，不在水平方向拉伸
-        left_frame.pack(side=tk.LEFT, fill=tk.Y, expand=True, padx=(0, self._scale_size(5)))
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, expand=True, padx=self.scale_padding((0, 5)))
 
         # 按钮与数据操作区（移动到左侧）
         button_frame = ttk.Frame(left_frame)
         # 保存引用，供彩蛋插入控件时控制相对位置
         self.button_frame = button_frame
-        button_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, self._scale_size(10)))
+        button_frame.pack(side=tk.TOP, fill=tk.X, pady=self.scale_padding((0, 10)))
 
         # 屏蔽GoodCRC 复选框（与按钮同一层级，靠右）
         self.filter_goodcrc_var = tk.BooleanVar(value=False)
@@ -558,7 +584,7 @@ class WITRNGUI:
             command=self.update_treeview
         )
         # 先放置右侧控件，再放置左侧按钮，有利于布局
-        self.filter_goodcrc_cb.pack(side=tk.RIGHT, padx=(0, self._scale_size(5)))
+        self.filter_goodcrc_cb.pack(side=tk.RIGHT, padx=self.scale_padding((0, 5)))
 
         # 相对时间 复选框（放在“屏蔽GoodCRC”的左边）
         self.relative_time_var = tk.BooleanVar(value=False)
@@ -569,13 +595,13 @@ class WITRNGUI:
             command=self.update_treeview
         )
         # 也使用靠右布局，后放置因此位于“屏蔽GoodCRC”的左侧
-        self.relative_time_cb.pack(side=tk.RIGHT, padx=(0, self._scale_size(10)))
+        self.relative_time_cb.pack(side=tk.RIGHT, padx=self.scale_padding((0, 10)))
 
         # 状态栏将放到按钮区下方，见后文
 
         # 控制按钮框架
         control_frame = ttk.Frame(button_frame)
-        control_frame.pack(side=tk.LEFT, padx=(0, self._scale_size(20)))
+        control_frame.pack(side=tk.LEFT, padx=self.scale_padding((0, 20)))
 
         # 连接按钮
         self.connect_button = ttk.Button(
@@ -583,7 +609,7 @@ class WITRNGUI:
             text="连接设备", 
             command=self.connect_device
         )
-        self.connect_button.pack(side=tk.LEFT, padx=(0, self._scale_size(5)))
+        self.connect_button.pack(side=tk.LEFT, padx=self.scale_padding((0, 5)))
         
         # 暂停按钮
         self.pause_button = ttk.Button(
@@ -592,7 +618,7 @@ class WITRNGUI:
             command=self.pause_collection,
             state=tk.DISABLED
         )
-        self.pause_button.pack(side=tk.LEFT, padx=(0, self._scale_size(5)))
+        self.pause_button.pack(side=tk.LEFT, padx=self.scale_padding((0, 5)))
 
         # 数据操作按钮框架
         data_frame = ttk.Frame(button_frame)
@@ -606,15 +632,15 @@ class WITRNGUI:
             command=self.export_list,
             state=tk.DISABLED
         )
-        self.export_button.pack(side=tk.LEFT, padx=(0, self._scale_size(10)))
+        self.export_button.pack(side=tk.LEFT, padx=self.scale_padding((0, 10)))
 
         # 导入CSV按钮
         self.import_button = ttk.Button(
             data_frame,
-            text="导入CSV",
-            command=self.import_csv
+            text="导入文件",
+            command=self.import_file
         )
-        self.import_button.pack(side=tk.LEFT, padx=(0, self._scale_size(10)))
+        self.import_button.pack(side=tk.LEFT, padx=self.scale_padding((0, 10)))
         
         # 清空按钮
         self.clear_button = ttk.Button(
@@ -625,7 +651,7 @@ class WITRNGUI:
         self.clear_button.pack(side=tk.LEFT)
 
         # 数据列表容器（用 LabelFrame 框住 Treeview），统一与右侧 padding 保持一致
-        list_group = ttk.LabelFrame(left_frame, text="数据列表", padding=self._scale_size(10))
+        list_group = ttk.LabelFrame(left_frame, text="数据列表", padding=self.scale_px(10))
         list_group.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
 
@@ -637,9 +663,8 @@ class WITRNGUI:
         column_widths = {'Index': 50, 'Time': 110, 'SOP': 90, 'Rev': 50, 'PPR': 140, 'PDR': 60, 'Msg Type': 210}
         for col in columns:
             self.tree.heading(col, text=col)
-            scaled_width = self._scale_size(column_widths[col])
             # 禁止随容器自动伸缩，固定列宽
-            self.tree.column(col, width=scaled_width, anchor=tk.CENTER, stretch=False)
+            self.tree.column(col, width=self.scale_px(column_widths[col]), anchor=tk.CENTER, stretch=False)
         
         # 添加滚动条
         tree_scrollbar = ttk.Scrollbar(list_group, orient=tk.VERTICAL, command=self.tree.yview)
@@ -696,7 +721,7 @@ class WITRNGUI:
         self.tree.bind('<Button-1>', self.on_item_click, add='+')
         
         # 右侧数据显示框架
-        right_frame = ttk.LabelFrame(main_frame, text="数据显示", padding=self._scale_size(10))
+        right_frame = ttk.LabelFrame(main_frame, text="数据显示", padding=self.scale_px(10))
         # 固定右侧宽度以配合左侧750和内边距（main_frame左右各10、左右分隔各5），此处取 820
         try:
             right_frame.configure(width=10000)
@@ -704,7 +729,7 @@ class WITRNGUI:
         except Exception:
             pass
         # 仅纵向扩展，宽度固定
-        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(self._scale_size(5), 0))
+        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=self.scale_padding((5, 0)))
         # 保存引用，供彩蛋绘图在其下方插入曲线区
         self.right_frame = right_frame
 
@@ -752,8 +777,8 @@ class WITRNGUI:
             bd=0,
             relief='flat',
             highlightthickness=0,
-            padx=self._scale_size(8),
-            pady=self._scale_size(4),
+            padx=self.scale_px(8),
+            pady=self.scale_px(4),
             font=(self.font_status, self.size_status)
         )
         # 左侧标签占据剩余空间
@@ -768,8 +793,8 @@ class WITRNGUI:
             bd=0,
             relief='flat',
             highlightthickness=0,
-            padx=self._scale_size(8),
-            pady=self._scale_size(4),
+            padx=self.scale_px(8),
+            pady=self.scale_px(4),
             font=(self.font_status, self.size_status)
         )
         self.quick_pd_label.pack(side=tk.RIGHT)
@@ -886,12 +911,12 @@ class WITRNGUI:
             if self.egg_top_row is None or not str(self.egg_top_row):
                 self.egg_top_row = ttk.Frame(self.left_frame)
                 try:
-                    self.egg_top_row.pack(side=tk.TOP, fill=tk.X, pady=(0, 8), before=self.button_frame)
+                    self.egg_top_row.pack(side=tk.TOP, fill=tk.X, pady=self.scale_padding((0, 8)), before=self.button_frame)
                 except Exception:
-                    self.egg_top_row.pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
+                    self.egg_top_row.pack(side=tk.TOP, fill=tk.X, pady=self.scale_padding((0, 8)))
                     try:
                         self.button_frame.pack_forget()
-                        self.button_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
+                        self.button_frame.pack(side=tk.TOP, fill=tk.X, pady=self.scale_padding((0, 10)))
                     except Exception:
                         pass
 
@@ -902,9 +927,9 @@ class WITRNGUI:
                         self.iv_info_frame.destroy()
                 except Exception:
                     pass
-                self.iv_info_frame = ttk.LabelFrame(self.egg_top_row, text="基本信息", padding=self._scale_size(8))
+                self.iv_info_frame = ttk.LabelFrame(self.egg_top_row, text="基本信息", padding=self.scale_px(8))
                 # 右侧面板占据剩余空间，并按Y方向填充与左侧保持同高
-                self.iv_info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(self._scale_size(8), 0))
+                self.iv_info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=self.scale_padding((8, 0)))
                 # 放置7个横向标签（电流、电压、功率、CC1、CC2、D+、D-）
                 try:
                     for child in getattr(self.iv_info_frame, 'winfo_children', lambda: [])():
@@ -929,7 +954,7 @@ class WITRNGUI:
                     text = f"{display_names[key]}: {self._iv_info_cached.get(key, '-')}"
                     width = int(self.iv_label_char_widths.get(key, 16))
                     lbl = ttk.Label(self.iv_info_frame, text=text, anchor='w', justify='left', width=width)
-                    lbl.pack(side=tk.LEFT, padx=(0, self._scale_size(2)))
+                    lbl.pack(side=tk.LEFT, padx=self.scale_padding((0, 2)))
                     self.iv_labels[key] = lbl
 
             # 4) 首次激活后，用缓存的电参信息刷新显示
@@ -995,24 +1020,6 @@ class WITRNGUI:
             self.root.bind_all('<FocusIn>', _on_focus_in, add='+')
         except Exception:
             pass
-
-    def _detect_ui_scale(self) -> float:
-        """Return the OS-level Tk scaling factor (>=1.0 when unavailable)."""
-        try:
-            scale = float(self.root.tk.call('tk', 'scaling'))
-            if scale > 0:
-                return scale
-        except Exception:
-            pass
-        return 1.0
-
-    def _scale_size(self, value: float) -> int:
-        """Scale pixel-based dimensions by the current DPI factor."""
-        try:
-            scale = getattr(self, 'ui_scale', 1.0)
-            return max(1, int(round(float(value) * scale)))
-        except Exception:
-            return int(value)
 
     def _refresh_iv_label_async(self):
         """异步刷新右侧电参标签的内容，保证在主线程更新。"""
@@ -1098,15 +1105,15 @@ class WITRNGUI:
         plt.rcParams['agg.path.chunksize'] = 10000
         if getattr(self, 'right_frame', None) is None:
             return
-        self.plot_group = ttk.LabelFrame(self.right_frame, text="电流/电压 曲线", padding=self._scale_size(6))
+        self.plot_group = ttk.LabelFrame(self.right_frame, text="电流/电压 曲线", padding=self.scale_px(6))
         # 放在底部，不参与 expand（保持固定高度）
         try:
-            self.plot_group.pack(side=tk.BOTTOM, fill=tk.X, expand=False, pady=(self._scale_size(8), 0))
+            self.plot_group.pack(side=tk.BOTTOM, fill=tk.X, expand=False, pady=self.scale_padding((8, 0)))
         except Exception:
-            self.plot_group.pack(side=tk.BOTTOM, fill=tk.X, pady=(self._scale_size(8), 0))
+            self.plot_group.pack(side=tk.BOTTOM, fill=tk.X, pady=self.scale_padding((8, 0)))
 
         # 承载画布的容器，固定高度，防止与上方文本竞争空间
-        self.plot_container = tk.Frame(self.plot_group, height=self._scale_size(260))
+        self.plot_container = tk.Frame(self.plot_group, height=self.scale_px(260))
         try:
             self.plot_container.pack_propagate(False)
         except Exception:
@@ -2064,18 +2071,18 @@ class WITRNGUI:
         text = ""
         if pdo is not None:
             if not pdo["Message Header"]["Extended"].value():
-                DO = pdo[3].value()
+                DO = pdo[2].value()
                 for i, obj in enumerate(DO):
                     if obj.quick_pdo() != "Not a PDO":
                         text += f" [{i+1}] {obj.quick_pdo()} |"
             else:
-                DO = pdo[4].value()
+                DO = pdo[3].value()
                 if DO != None and DO != "Incomplete Data":
                     for i, obj in enumerate(DO):
                         if obj.quick_pdo() != "Not a PDO":
                             text += f" [{i+1}] {obj.quick_pdo()} |"
         if rdo is not None:
-            DO = rdo[3].value()
+            DO = rdo[2].value()
             if DO == "Invalid Request Message":
                 text += "| Invalid RDO"
             else:
@@ -2727,11 +2734,9 @@ class WITRNGUI:
             self.data_text.insert(tk.END, f"{item.msg_type}\n", 'gray')
             self.data_text.insert(tk.END, "\n==== 详细数据 ====\n", 'cn')
             self.data_text.insert(tk.END, f"Raw: 0x{int(item.data.raw(), 2):0{int(len(item.data.raw())/4)+(1 if len(item.data.raw())%4!=0 else 0)}X}\n", 'green')
-            lst = []
-            for i in item.data.value():
-                renderer(i, 0, lst)
+            lst = renderer(item.data, level_thr=3)
             for line in lst:
-                self.data_text.insert(tk.END, line[0], line[1])
+                self.data_text.insert(tk.END, line[1], line[0])
         finally:
             # 设回只读，防止用户编辑
             self.data_text.config(state=tk.DISABLED)
@@ -2782,18 +2787,19 @@ class WITRNGUI:
         except Exception as e:
             messagebox.showerror("导出失败", f"导出 CSV 失败:\n{e}")
 
-    def import_csv(self):
-        """从CSV导入数据，仅解析两列：时间、Raw（全大写HEX）。
+    def import_file(self):
+        """从文件导入数据，仅解析两列：时间、Raw（全大写HEX）。
         Raw 将被转换为长度为64字节的uint8列表（不足末尾补0，超出则截断），
-        然后使用 WITRN_DEV.auto_unpack(data) 解析并加入列表。
+        如果是sqplit进行一次转换，
+        然后使用 Sniffer.unpack(data) 解析并加入列表。
         """
         # 若正在进行数据采集（未暂停），阻止导入
         if not self.is_paused:
-            messagebox.showwarning("操作受限", "正在收集数据，无法导入CSV。请先暂停并清空列表后再试。")
+            messagebox.showwarning("操作受限", "正在收集数据，无法导入文件。请先暂停并清空列表后再试。")
             return
         file_path = filedialog.askopenfilename(
-            filetypes=[('CSV 文件', '*.csv')],
-            title='选择CSV文件'
+            filetypes=[('PD数据文件', ['*.csv', '*.sqlite'])],
+            title='选择PD数据文件'
         )
         if not file_path:
             return
@@ -2808,62 +2814,51 @@ class WITRNGUI:
             pass
 
         success, failed = 0, 0
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                # 兼容可能的列名大小写或空格
-                col_map = {k.strip(): k for k in reader.fieldnames or []}
-                def get_col(name_alternatives):
-                    for n in name_alternatives:
-                        if n in col_map:
-                            return col_map[n]
-                    return None
-
-                time_col = get_col(["时间", "time", "Time"])
-                raw_col = get_col(["Raw", "RAW", "raw"])
-                if raw_col is None:
-                    raise ValueError("CSV中缺少列：Raw")
-                
-                last_pdo = None
-                last_rdo = None
-                last_ext = None
-
-                for row in reader:
+        if file_path.lower().endswith('.sqlite'):
+            try:
+                    _SOP = {
+                        "00": "E0",
+                        "01": "C0",
+                        "02": "A0",
+                    }
+                    conn = sqlite3.connect(file_path)
+                    cursor = conn.cursor()
                     try:
-                        t_str = row[time_col].strip() if time_col and row.get(time_col) is not None else None
-                        raw_hex = (row.get(raw_col) or "").strip()
-                        if not raw_hex:
-                            failed += 1
+                        cursor.execute("SELECT Raw FROM pd_table")
+                    except Exception:
+                        raise ValueError("SQLite数据库格式不正确，缺少 pd_table 表或 Raw 列。")
+                    rows = cursor.fetchall()
+
+                    for row in rows:
+                        sop = _SOP.get(row[0].hex()[10:12], None)
+                        if sop is None:
                             continue
+                        row_hex = row[0].hex().upper()
+                        msg = row_hex[12:]
+                        length = len(msg) // 2 + 1
+                        length_hex = f"{length:02X}"
+                        timestamp = int(row_hex[4:6]+row_hex[2:4], 16)
+                        BASE_TIME = datetime.strptime("00:00:00.000", "%H:%M:%S.%f")
+                        timestamp = (BASE_TIME + timedelta(seconds=timestamp)).strftime("%H:%M:%S.%f")[:-3]
+                        msg = "FE" + length_hex + sop + msg
 
-                        # 允许前缀0x，可选空格，统一为连续十六进制
-                        raw_hex = raw_hex.replace(" ", "").replace("0X", "0x")
-                        if raw_hex.startswith("0x"):
-                            raw_hex = raw_hex[2:]
-                        # 若为奇数长度，前置0补齐
-                        if len(raw_hex) % 2 == 1:
-                            raw_hex = '0' + raw_hex
-
-                        # 将HEX字符串转为字节数组（大写/小写均可）
-                        try:
-                            data_bytes = bytearray.fromhex(raw_hex)
-                        except Exception:
-                            failed += 1
-                            continue
-
-                        # 规范到64字节：超出则截断，不足则末尾补0
-                        if len(data_bytes) > 64:
-                            data_bytes = data_bytes[:64]
-                        elif len(data_bytes) < 64:
-                            data_bytes.extend([0] * (64 - len(data_bytes)))
+                        last_pdo = None
+                        last_rdo = None
+                        last_ext = None
 
                         # 解析
                         try:
                             if self.parser is None:
-                                # 若仍无k2，跳过解析
                                 failed += 1
                                 continue
-                            _, pkg = self.parser.auto_unpack(data_bytes, last_pdo, last_ext, last_rdo)
+
+                            data_bytes = bytearray.fromhex(msg)
+                            if len(data_bytes) > 64:
+                                data_bytes = data_bytes[:64]
+                            elif len(data_bytes) < 64:
+                                data_bytes.extend([0] * (64 - len(data_bytes)))
+                            
+                            _, pkg = self.parser.auto_unpack(list(data_bytes), last_pdo, last_ext, last_rdo)
                             if is_pdo(pkg):
                                 last_pdo = pkg
                             if is_rdo(pkg):
@@ -2871,7 +2866,7 @@ class WITRNGUI:
                             if provide_ext(pkg):
                                 last_ext = pkg
                             
-                        except Exception:
+                        except Exception as e:
                             failed += 1
                             continue
 
@@ -2881,49 +2876,166 @@ class WITRNGUI:
                                 try:
                                     rev = pkg["Message Header"][4].value()[4:]
                                     if rev == 'rved':
-                                        rev = None
+                                        rev = ""
                                 except Exception:
-                                    rev = None
+                                    rev = ""
                                 try:
                                     ppr = pkg["Message Header"][3].value()
                                 except Exception:
-                                    ppr = None
+                                    ppr = ""
                                 try:
                                     pdr = pkg["Message Header"][5].value()
+                                    if pdr == None:
+                                        pdr = "?"
                                 except Exception:
-                                    pdr = None
+                                    pdr = ""
                                 try:
                                     msg_type = pkg["Message Header"]["Message Type"].value()
                                 except Exception:
-                                    msg_type = None
-                                self.add_data_item(sop, rev, ppr, pdr, msg_type, pkg, force=True, timestamp=t_str)
+                                    msg_type = ""
+                                self.add_data_item(sop, rev, ppr, pdr, msg_type, pkg, force=True, timestamp=timestamp)
                                 success += 1
                             else:
                                 failed += 1
                         except Exception:
                             failed += 1
                             continue
+
+                    # 导入完成，刷新视图
+                    self.update_treeview()
+                    # 启用导出按钮（若有数据）
+                    try:
+                        if self.data_list:
+                            self.export_button.config(state=tk.NORMAL)
                     except Exception:
-                        failed += 1
-                        continue
+                        pass
+                    # 进入导入模式
+                    self.import_mode = True
 
-            # 导入完成，刷新视图
-            self.update_treeview()
-            # 启用导出按钮（若有数据）
+                    if self.device_open:
+                        self.set_status(f"导入完成：成功 {success} 条，失败 {failed} 条。可开始收集（会先清空）。", level='ok')
+                    else:
+                        self.set_status(f"导入完成：成功 {success} 条，失败 {failed} 条。设备未连接，无法开始收集；请先连接设备。", level='warn')
+            except Exception as e:
+                messagebox.showerror("导入失败", f"无法导入SQLite:\n{e}")
+        else:
             try:
-                if self.data_list:
-                    self.export_button.config(state=tk.NORMAL)
-            except Exception:
-                pass
-            # 进入导入模式
-            self.import_mode = True
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    # 兼容可能的列名大小写或空格
+                    col_map = {k.strip(): k for k in reader.fieldnames or []}
+                    def get_col(name_alternatives):
+                        for n in name_alternatives:
+                            if n in col_map:
+                                return col_map[n]
+                        return None
 
-            if self.device_open:
-                self.set_status(f"导入完成：成功 {success} 条，失败 {failed} 条。可开始收集（会先清空）。", level='ok')
-            else:
-                self.set_status(f"导入完成：成功 {success} 条，失败 {failed} 条。设备未连接，无法开始收集；请先连接设备。", level='warn')
-        except Exception as e:
-            messagebox.showerror("导入失败", f"无法导入CSV:\n{e}")
+                    time_col = get_col(["时间", "time", "Time"])
+                    raw_col = get_col(["Raw", "RAW", "raw"])
+                    if raw_col is None:
+                        raise ValueError("CSV中缺少列：Raw")
+                    
+                    last_pdo = None
+                    last_rdo = None
+                    last_ext = None
+
+                    for row in reader:
+                        try:
+                            t_str = row[time_col].strip() if time_col and row.get(time_col) is not None else None
+                            raw_hex = (row.get(raw_col) or "").strip()
+                            if not raw_hex:
+                                failed += 1
+                                continue
+
+                            # 允许前缀0x，可选空格，统一为连续十六进制
+                            raw_hex = raw_hex.replace(" ", "").replace("0X", "0x")
+                            if raw_hex.startswith("0x"):
+                                raw_hex = raw_hex[2:]
+                            # 若为奇数长度，前置0补齐
+                            if len(raw_hex) % 2 == 1:
+                                raw_hex = '0' + raw_hex
+
+                            # 将HEX字符串转为字节数组（大写/小写均可）
+                            try:
+                                data_bytes = bytearray.fromhex(raw_hex)
+                            except Exception:
+                                failed += 1
+                                continue
+
+                            # 规范到64字节：超出则截断，不足则末尾补0
+                            if len(data_bytes) > 64:
+                                data_bytes = data_bytes[:64]
+                            elif len(data_bytes) < 64:
+                                data_bytes.extend([0] * (64 - len(data_bytes)))
+
+                            # 解析
+                            try:
+                                if self.parser is None:
+                                    # 若仍无k2，跳过解析
+                                    failed += 1
+                                    continue
+                                _, pkg = self.parser.auto_unpack(list(data_bytes), last_pdo, last_ext, last_rdo)
+                                if is_pdo(pkg):
+                                    last_pdo = pkg
+                                if is_rdo(pkg):
+                                    last_rdo = pkg
+                                if provide_ext(pkg):
+                                    last_ext = pkg
+                                
+                            except Exception:
+                                failed += 1
+                                continue
+
+                            try:
+                                if pkg.field() == "pd":
+                                    sop = pkg["SOP*"].value()
+                                    try:
+                                        rev = pkg["Message Header"][4].value()[4:]
+                                        if rev == 'rved':
+                                            rev = None
+                                    except Exception:
+                                        rev = None
+                                    try:
+                                        ppr = pkg["Message Header"][3].value()
+                                    except Exception:
+                                        ppr = None
+                                    try:
+                                        pdr = pkg["Message Header"][5].value()
+                                    except Exception:
+                                        pdr = None
+                                    try:
+                                        msg_type = pkg["Message Header"]["Message Type"].value()
+                                    except Exception:
+                                        msg_type = None
+                                    self.add_data_item(sop, rev, ppr, pdr, msg_type, pkg, force=True, timestamp=t_str)
+                                    success += 1
+                                else:
+                                    failed += 1
+                            except Exception:
+                                failed += 1
+                                continue
+                        except Exception:
+                            failed += 1
+                            continue
+
+                # 导入完成，刷新视图
+                self.update_treeview()
+                # 启用导出按钮（若有数据）
+                try:
+                    if self.data_list:
+                        self.export_button.config(state=tk.NORMAL)
+                except Exception:
+                    pass
+                # 进入导入模式
+                self.import_mode = True
+
+                if self.device_open:
+                    self.set_status(f"导入完成：成功 {success} 条，失败 {failed} 条。可开始收集（会先清空）。", level='ok')
+                else:
+                    self.set_status(f"导入完成：成功 {success} 条，失败 {failed} 条。设备未连接，无法开始收集；请先连接设备。", level='warn')
+            except Exception as e:
+                messagebox.showerror("导入失败", f"无法导入文件:\n{e}")
+
         
     def connect_device(self):
         """连接/断开设备（连接/断开仅由采集进程处理，主进程不直接 open/close 设备）。"""
@@ -3162,8 +3274,8 @@ python -m nuitka witrn_pd_sniffer.py ^
 --enable-plugin=tk-inter ^
 --windows-icon-from-ico=brain.ico ^
 --product-name="WITRN PD Sniffer" ^
---product-version=3.7.3.0 ^
+--product-version=3.7.5.0 ^
 --copyright="JohnScotttt" ^
 --output-dir=output ^
---output-filename=witrn_pd_sniffer_v3.7.3.exe
+--output-filename=witrn_pd_sniffer_v3.7.5.exe
 """
