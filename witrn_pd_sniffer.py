@@ -15,6 +15,7 @@ import ctypes
 import csv
 import threading
 import time
+import zipfile
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from witrnhid import WITRN_DEV, metadata, is_pdo, is_rdo, provide_ext, renderer
@@ -98,6 +99,221 @@ MT = {
     "Vendor_Defined_Extended": "#bdb2ff",
     "Reserved": "#fa8072",
 }
+
+
+DEC4B5B = [
+    0x10,   # Error      00000
+    0x10,   # Error      00001
+    0x10,   # Error      00010
+    0x10,   # Error      00011
+    0x10,   # Error      00100
+    0x10,   # Error      00101
+    0x13,   # Sync-3     00110
+    0x14,   # RST-1      00111
+    0x10,   # Error      01000
+    0x01,   # 1 = 0001   01001
+    0x04,   # 4 = 0100   01010
+    0x05,   # 5 = 0101   01011
+    0x10,   # Error      01100
+    0x16,   # EOP        01101
+    0x06,   # 6 = 0110   01110
+    0x07,   # 7 = 0111   01111
+    0x10,   # Error      10000
+    0x12,   # Sync-2     10001
+    0x08,   # 8 = 1000   10010
+    0x09,   # 9 = 1001   10011
+    0x02,   # 2 = 0010   10100
+    0x03,   # 3 = 0011   10101
+    0x0A,   # A = 1010   10110
+    0x0B,   # B = 1011   10111
+    0x11,   # Sync-1     11000
+    0x15,   # RST-2      11001
+    0x0C,   # C = 1100   11010
+    0x0D,   # D = 1101   11011
+    0x0E,   # E = 1110   11100
+    0x0F,   # F = 1111   11101
+    0x00,   # 0 = 0000   11110
+    0x10,   # Error      11111
+]
+
+
+START_OF_PACKETS = {
+    (0x11, 0x11, 0x11, 0x12): "SOP",
+    (0x11, 0x11, 0x13, 0x13): "SOP'",
+    (0x11, 0x33, 0x11, 0x33): "SOP''",
+    (0x11, 0x15, 0x15, 0x13): "SOP'_DEBUG",
+    (0x11, 0x15, 0x13, 0x12): "SOP''_DEBUG",
+}
+
+
+def iter_bits(data: bytes):
+    for byte in data:
+        for i in range(8):
+            yield (byte >> i) & 1
+
+
+def splice(data: list[int]) -> bytes:
+    if len(data) % 2 != 0:
+        return b""
+
+    result = bytearray()
+    for i in range(0, len(data), 2):
+        a = data[i]
+        b = data[i+1]
+        if not (0 <= a <= 0xF and 0 <= b <= 0xF):
+            return b""
+
+        result.append((b << 4) | a)
+
+    return bytes(result)
+
+
+def decoder_bmc(data: bytes, tolerance: int = 1, ignore: int = 4) -> tuple[bool, str]:
+    it = iter_bits(data)
+    last = next(it)
+    pos = 0
+    edges = []
+    for bit in it:
+        pos += 1
+        if bit != last:
+            edges.append(pos)
+            last = bit
+
+    intervals = {}
+    for i in range(1, len(edges)):
+        diff = edges[i] - edges[i-1]
+        if diff not in intervals:
+            intervals[diff] = 0
+        intervals[diff] += 1
+
+    sorted_intervals = sorted(intervals.items(), key=lambda item: item[1], reverse=True)
+    if len(sorted_intervals) < 2:
+        return False, "Not enough intervals found"
+    if sorted_intervals[0][0] * 2 == sorted_intervals[1][0]:
+        T_half = sorted_intervals[0][0]
+        T_full = sorted_intervals[1][0]
+    elif sorted_intervals[1][0] * 2 == sorted_intervals[0][0]:
+        T_half = sorted_intervals[1][0]
+        T_full = sorted_intervals[0][0]
+    else:
+        return False, "Cannot determine T_half and T_full"
+    decoded = []
+    half_flag = False
+    for i in range(1, len(edges)):
+        diff = edges[i] - edges[i-1]
+        if abs(diff - T_full) <= tolerance:
+            if not half_flag:
+                decoded.append("0")
+            elif i <= ignore:
+                decoded.append("0")
+                half_flag = False
+            else:
+                return False, "Invalid BMC encoding: unexpected full interval"
+        elif abs(diff - T_half) <= tolerance:
+            if not half_flag:
+                half_flag = True
+            else:
+                decoded.append("1")
+                half_flag = False
+
+    return True, "".join(decoded)
+
+
+def decoder_4b5b(data: str) -> tuple[bool, str, bytes]:
+    i = 0
+    sop_tuple = ()
+    sop_flag = False
+    eop_flag = False
+    decoded = []
+    while i + 5 <= len(data):
+        window = data[i:i+5][::-1]
+        val = DEC4B5B[int(window, 2)]
+        if not sop_flag: # Look for SOP
+            if val == 0x11:
+                sop_tuple += (val,)
+                if i + 20 <= len(data):
+                    sop_tuple += (DEC4B5B[int(data[i+5:i+10][::-1], 2)],)
+                    sop_tuple += (DEC4B5B[int(data[i+10:i+15][::-1], 2)],)
+                    sop_tuple += (DEC4B5B[int(data[i+15:i+20][::-1], 2)],)
+                    sop = START_OF_PACKETS.get(sop_tuple, "")
+                    # print(sop)
+                    sop_flag = True
+                else:
+                    return False, "", b""
+                i += 20
+            else:
+                i += 1
+        elif not eop_flag: # Capture data until EOP
+            if val == 0x16:
+                eop_flag = True
+            else:
+                if val < 0x10:
+                    decoded.append(val)
+                else:
+                    return False, "", b""
+            i += 5
+        else: # Capture SOP and EOP
+            return True, sop, splice(decoded)
+
+    if not sop_flag or not eop_flag:
+        return False, "", b""
+    else:
+        return True, sop, splice(decoded)
+
+
+def extract_segments(data: bytes, ff_len: int = 8, min_edges: int = 50) -> list[tuple[int, bytes]]:
+    # 新版 atkcc 采样文件在有效数据之间使用大段 0x00（旧版为 0xFF）作为填充，
+    # 因此 0xFF 与 0x00 的长游程都视为空白区。
+    blanks = (0xFF, 0x00)
+
+    def _count_edges(seg: bytes) -> int:
+        """统计电平跳变次数，用于剔除只有零星跳变的噪声片段。"""
+        edges = 0
+        last = None
+        for byte in seg:
+            for k in range(8):
+                bit = (byte >> k) & 1
+                if last is not None and bit != last:
+                    edges += 1
+                last = bit
+        return edges
+
+    results = []
+
+    i = 0
+    n = len(data)
+
+    while i < n:
+        # 跳过填充区（0xFF 或 0x00 的长游程）
+        if data[i] in blanks:
+            fill = data[i]
+            j = i
+            while j < n and data[j] == fill:
+                j += 1
+            # 如果是大量填充字节，当作空白区
+            if j - i >= ff_len:
+                i = j
+                continue
+        # 进入有效数据区
+        start = i
+        i += 1
+        while i < n:
+            if data[i] in blanks:
+                fill = data[i]
+                j = i
+                while j < n and data[j] == fill:
+                    j += 1
+                if j - i >= ff_len:
+                    break
+            i += 1
+        end = i
+        segment = data[start:end]
+        # 仅保留跳变足够多的片段：合法 PD 报文有数百次跳变，
+        # 而单字节毛刺等噪声只有 1~2 次跳变，直接丢弃以免产生大量解析错误。
+        if _count_edges(segment) >= min_edges:
+            results.append((start, segment))
+
+    return results
 
 
 # ==================== 数据采集进程函数 ====================
@@ -289,7 +505,7 @@ class WITRNGUI:
         except Exception:
             pass
         self._init_ui_scale()
-        self.root.title("WITRN PD Sniffer v3.7.5 by JohnScotttt")
+        self.root.title("WITRN PD Sniffer v3.7.8 by JohnScotttt")
         # 使用内置的 base64 图标（brain_ico）设置窗口图标；失败则回退到本地 brain.ico
         try:
             ico_bytes = base64.b64decode(brain_ico)
@@ -2773,6 +2989,15 @@ class WITRNGUI:
                 for item in self.data_list:
                     # 使用 format_data 输出的人类可读文本作为详细数据字段
                     data_text = self.format_data(item.data)
+                    _SOP = {
+                        "SOP": "E0",
+                        "SOP'": "C0",
+                        "SOP''": "A0",
+                        "SOP'_DEBUG": "80",
+                        "SOP''_DEBUG": "60",
+                    }
+                    sop = _SOP.get(item.sop, "E0")
+                    length = len(item.data.raw()) // 8 + 1
                     writer.writerow([item.index,
                                      item.timestamp,
                                      item.sop,
@@ -2781,7 +3006,7 @@ class WITRNGUI:
                                      item.pdr,
                                      item.msg_type,
                                      data_text,
-                                     f"{int(item.data.raw(), 2):0{int(len(item.data.raw())/4)+(1 if len(item.data.raw())%4!=0 else 0)}X}"])
+                                     f"FE{length:02X}{sop}{int(item.data.raw(), 2):0{int(len(item.data.raw())/4)+(1 if len(item.data.raw())%4!=0 else 0)}X}"])
 
             self.set_status(f"已导出 {len(self.data_list)} 条数据 到 {file_path}", level='ok')
         except Exception as e:
@@ -2798,7 +3023,7 @@ class WITRNGUI:
             messagebox.showwarning("操作受限", "正在收集数据，无法导入文件。请先暂停并清空列表后再试。")
             return
         file_path = filedialog.askopenfilename(
-            filetypes=[('PD数据文件', ['*.csv', '*.sqlite'])],
+            filetypes=[('PD数据文件', ['*.csv', '*.sqlite', '*.atkcc'])],
             title='选择PD数据文件'
         )
         if not file_path:
@@ -2816,108 +3041,225 @@ class WITRNGUI:
         success, failed = 0, 0
         if file_path.lower().endswith('.sqlite'):
             try:
-                    _SOP = {
-                        "00": "E0",
-                        "01": "C0",
-                        "02": "A0",
-                    }
-                    conn = sqlite3.connect(file_path)
-                    cursor = conn.cursor()
+                _SOP = {
+                    "00": "E0",
+                    "01": "C0",
+                    "02": "A0",
+                }
+                conn = sqlite3.connect(file_path)
+                cursor = conn.cursor()
+                try:
+                    cursor.execute("SELECT Raw FROM pd_table")
+                except Exception:
+                    raise ValueError("SQLite数据库格式不正确，缺少 pd_table 表或 Raw 列。")
+                rows = cursor.fetchall()
+
+                for row in rows:
+                    sop = _SOP.get(row[0].hex()[10:12], None)
+                    if sop is None:
+                        failed += 1
+                        continue
+                    row_hex = row[0].hex().upper()
+                    msg = row_hex[12:]
+                    length = len(msg) // 2 + 1
+                    length_hex = f"{length:02X}"
+                    timestamp = int(row_hex[4:6]+row_hex[2:4], 16)
+                    BASE_TIME = datetime.strptime("00:00:00.000", "%H:%M:%S.%f")
+                    timestamp = (BASE_TIME + timedelta(seconds=timestamp)).strftime("%H:%M:%S.%f")[:-3]
+                    msg = "FE" + length_hex + sop + msg
+
+                    last_pdo = None
+                    last_rdo = None
+                    last_ext = None
+
+                    # 解析
                     try:
-                        cursor.execute("SELECT Raw FROM pd_table")
-                    except Exception:
-                        raise ValueError("SQLite数据库格式不正确，缺少 pd_table 表或 Raw 列。")
-                    rows = cursor.fetchall()
-
-                    for row in rows:
-                        sop = _SOP.get(row[0].hex()[10:12], None)
-                        if sop is None:
-                            continue
-                        row_hex = row[0].hex().upper()
-                        msg = row_hex[12:]
-                        length = len(msg) // 2 + 1
-                        length_hex = f"{length:02X}"
-                        timestamp = int(row_hex[4:6]+row_hex[2:4], 16)
-                        BASE_TIME = datetime.strptime("00:00:00.000", "%H:%M:%S.%f")
-                        timestamp = (BASE_TIME + timedelta(seconds=timestamp)).strftime("%H:%M:%S.%f")[:-3]
-                        msg = "FE" + length_hex + sop + msg
-
-                        last_pdo = None
-                        last_rdo = None
-                        last_ext = None
-
-                        # 解析
-                        try:
-                            if self.parser is None:
-                                failed += 1
-                                continue
-
-                            data_bytes = bytearray.fromhex(msg)
-                            if len(data_bytes) > 64:
-                                data_bytes = data_bytes[:64]
-                            elif len(data_bytes) < 64:
-                                data_bytes.extend([0] * (64 - len(data_bytes)))
-                            
-                            _, pkg = self.parser.auto_unpack(list(data_bytes), last_pdo, last_ext, last_rdo)
-                            if is_pdo(pkg):
-                                last_pdo = pkg
-                            if is_rdo(pkg):
-                                last_rdo = pkg
-                            if provide_ext(pkg):
-                                last_ext = pkg
-                            
-                        except Exception as e:
+                        if self.parser is None:
                             failed += 1
                             continue
 
-                        try:
-                            if pkg.field() == "pd":
-                                sop = pkg["SOP*"].value()
-                                try:
-                                    rev = pkg["Message Header"][4].value()[4:]
-                                    if rev == 'rved':
-                                        rev = ""
-                                except Exception:
+                        data_bytes = bytearray.fromhex(msg)
+                        if len(data_bytes) > 64:
+                            data_bytes = data_bytes[:64]
+                        elif len(data_bytes) < 64:
+                            data_bytes.extend([0] * (64 - len(data_bytes)))
+
+                        _, pkg = self.parser.auto_unpack(list(data_bytes), last_pdo, last_ext, last_rdo)
+                        if is_pdo(pkg):
+                            last_pdo = pkg
+                        if is_rdo(pkg):
+                            last_rdo = pkg
+                        if provide_ext(pkg):
+                            last_ext = pkg
+
+                    except Exception as e:
+                        failed += 1
+                        continue
+
+                    try:
+                        if pkg.field() == "pd":
+                            sop = pkg["SOP*"].value()
+                            try:
+                                rev = pkg["Message Header"][4].value()[4:]
+                                if rev == 'rved':
                                     rev = ""
-                                try:
-                                    ppr = pkg["Message Header"][3].value()
-                                except Exception:
-                                    ppr = ""
-                                try:
-                                    pdr = pkg["Message Header"][5].value()
-                                    if pdr == None:
-                                        pdr = "?"
-                                except Exception:
-                                    pdr = ""
-                                try:
-                                    msg_type = pkg["Message Header"]["Message Type"].value()
-                                except Exception:
-                                    msg_type = ""
-                                self.add_data_item(sop, rev, ppr, pdr, msg_type, pkg, force=True, timestamp=timestamp)
-                                success += 1
-                            else:
-                                failed += 1
-                        except Exception:
+                            except Exception:
+                                rev = ""
+                            try:
+                                ppr = pkg["Message Header"][3].value()
+                            except Exception:
+                                ppr = ""
+                            try:
+                                pdr = pkg["Message Header"][5].value()
+                                if pdr == None:
+                                    pdr = "?"
+                            except Exception:
+                                pdr = ""
+                            try:
+                                msg_type = pkg["Message Header"]["Message Type"].value()
+                            except Exception:
+                                msg_type = ""
+                            self.add_data_item(sop, rev, ppr, pdr, msg_type, pkg, force=True, timestamp=timestamp)
+                            success += 1
+                        else:
                             failed += 1
-                            continue
-
-                    # 导入完成，刷新视图
-                    self.update_treeview()
-                    # 启用导出按钮（若有数据）
-                    try:
-                        if self.data_list:
-                            self.export_button.config(state=tk.NORMAL)
                     except Exception:
-                        pass
-                    # 进入导入模式
-                    self.import_mode = True
+                        failed += 1
+                        continue
 
-                    if self.device_open:
-                        self.set_status(f"导入完成：成功 {success} 条，失败 {failed} 条。可开始收集（会先清空）。", level='ok')
-                    else:
-                        self.set_status(f"导入完成：成功 {success} 条，失败 {failed} 条。设备未连接，无法开始收集；请先连接设备。", level='warn')
+                # 导入完成，刷新视图
+                self.update_treeview()
+                # 启用导出按钮（若有数据）
+                try:
+                    if self.data_list:
+                        self.export_button.config(state=tk.NORMAL)
+                except Exception:
+                    pass
+                # 进入导入模式
+                self.import_mode = True
+
+                if self.device_open:
+                    self.set_status(f"导入完成：成功 {success} 条，失败 {failed} 条。可开始收集（会先清空）。", level='ok')
+                else:
+                    self.set_status(f"导入完成：成功 {success} 条，失败 {failed} 条。设备未连接，无法开始收集；请先连接设备。", level='warn')
             except Exception as e:
                 messagebox.showerror("导入失败", f"无法导入SQLite:\n{e}")
+        elif file_path.endswith('.atkcc'):
+            try:
+                _SOP = {
+                    "SOP": "E0",
+                    "SOP'": "C0",
+                    "SOP''": "A0",
+                    "SOP'_DEBUG": "80",
+                    "SOP''_DEBUG": "60",
+                }
+                with zipfile.ZipFile(file_path, "r") as z:
+                    bin_num = len(z.namelist()) - 4
+                    all_data = bytearray()
+                    for i in range(bin_num):
+                        with z.open(f"0/0-{i}.bin") as f:
+                            data = f.read()
+                            all_data.extend(data)
+                segments = extract_segments(all_data.rstrip(b'\x00'))
+                for offset, segment in segments:
+                    status_bmc, decoded_bmc = decoder_bmc(segment)
+                    if not status_bmc:
+                        failed += 1
+                        continue
+                    status_4b5b, sop, decoded_4b5b = decoder_4b5b(decoded_bmc)
+                    if not status_4b5b:
+                        failed += 1
+                        continue
+
+                    msg = decoded_4b5b.hex().upper()
+                    sop = _SOP.get(sop, None)
+                    if sop is None:
+                        failed += 1
+                        continue
+                    length = len(msg) // 2 + 1
+                    length_hex = f"{length:02X}"
+                    timestamp = offset * 3.2 / 1e6
+                    BASE_TIME = datetime.strptime("00:00:00.000", "%H:%M:%S.%f")
+                    timestamp = (BASE_TIME + timedelta(seconds=timestamp)).strftime("%H:%M:%S.%f")[:-3]
+                    msg = "FE" + length_hex + sop + msg
+
+
+                    last_pdo = None
+                    last_rdo = None
+                    last_ext = None
+
+                    # 解析
+                    try:
+                        if self.parser is None:
+                            failed += 1
+                            continue
+
+                        data_bytes = bytearray.fromhex(msg)
+                        if len(data_bytes) > 64:
+                            data_bytes = data_bytes[:64]
+                        elif len(data_bytes) < 64:
+                            data_bytes.extend([0] * (64 - len(data_bytes)))
+
+                        _, pkg = self.parser.auto_unpack(list(data_bytes), last_pdo, last_ext, last_rdo)
+                        if is_pdo(pkg):
+                            last_pdo = pkg
+                        if is_rdo(pkg):
+                            last_rdo = pkg
+                        if provide_ext(pkg):
+                            last_ext = pkg
+
+                    except Exception as e:
+                        failed += 1
+                        continue
+
+                    try:
+                        if pkg.field() == "pd":
+                            sop = pkg["SOP*"].value()
+                            try:
+                                rev = pkg["Message Header"][4].value()[4:]
+                                if rev == 'rved':
+                                    rev = ""
+                            except Exception:
+                                rev = ""
+                            try:
+                                ppr = pkg["Message Header"][3].value()
+                            except Exception:
+                                ppr = ""
+                            try:
+                                pdr = pkg["Message Header"][5].value()
+                                if pdr == None:
+                                    pdr = "?"
+                            except Exception:
+                                pdr = ""
+                            try:
+                                msg_type = pkg["Message Header"]["Message Type"].value()
+                            except Exception:
+                                msg_type = ""
+                            self.add_data_item(sop, rev, ppr, pdr, msg_type, pkg, force=True, timestamp=timestamp)
+                            success += 1
+                        else:
+                            failed += 1
+                    except Exception:
+                        failed += 1
+                        continue
+
+                # 导入完成，刷新视图
+                self.update_treeview()
+                # 启用导出按钮（若有数据）
+                try:
+                    if self.data_list:
+                        self.export_button.config(state=tk.NORMAL)
+                except Exception:
+                    pass
+                # 进入导入模式
+                self.import_mode = True
+
+                if self.device_open:
+                    self.set_status(f"导入完成：成功 {success} 条，失败 {failed} 条。可开始收集（会先清空）。", level='ok')
+                else:
+                    self.set_status(f"导入完成：成功 {success} 条，失败 {failed} 条。设备未连接，无法开始收集；请先连接设备。", level='warn')
+            except Exception as e:
+                messagebox.showerror("导入失败", f"无法导入atkcc:\n{e}")
         else:
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
@@ -3274,8 +3616,8 @@ python -m nuitka witrn_pd_sniffer.py ^
 --enable-plugin=tk-inter ^
 --windows-icon-from-ico=brain.ico ^
 --product-name="WITRN PD Sniffer" ^
---product-version=3.7.5.0 ^
+--product-version=3.7.8.0 ^
 --copyright="JohnScotttt" ^
 --output-dir=output ^
---output-filename=witrn_pd_sniffer_v3.7.5.exe
+--output-filename=witrn_pd_sniffer_v3.7.8.exe
 """
